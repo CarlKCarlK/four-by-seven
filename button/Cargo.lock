@@ -123,6 +123,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed570934406eb16438a4e976b1b4500774099c13b8cb96eec99f620f05090ddf"
 
 [[package]]
+name = "button"
+version = "0.1.0"
+dependencies = [
+ "byte-slice-cast 1.2.2",
+ "cortex-m",
+ "cortex-m-rt",
+ "cyw43",
+ "cyw43-pio",
+ "defmt",
+ "defmt-rtt",
+ "display-interface",
+ "display-interface-spi",
+ "embassy-embedded-hal",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-net-wiznet",
+ "embassy-rp",
+ "embassy-sync",
+ "embassy-time",
+ "embassy-usb",
+ "embassy-usb-logger",
+ "embedded-graphics",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-hal-bus",
+ "embedded-io-async",
+ "embedded-storage",
+ "fixed",
+ "fixed-macro",
+ "futures",
+ "heapless 0.8.0",
+ "log",
+ "panic-probe",
+ "pio",
+ "pio-proc",
+ "portable-atomic",
+ "rand",
+ "smart-leds",
+ "st7789",
+ "static_cell",
+ "usbd-hid",
+]
+
+[[package]]
 name = "byte-slice-cast"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -522,51 +567,6 @@ dependencies = [
  "rand_core",
  "rp-pac",
  "rp2040-boot2",
-]
-
-[[package]]
-name = "embassy-rp-examples"
-version = "0.1.0"
-dependencies = [
- "byte-slice-cast 1.2.2",
- "cortex-m",
- "cortex-m-rt",
- "cyw43",
- "cyw43-pio",
- "defmt",
- "defmt-rtt",
- "display-interface",
- "display-interface-spi",
- "embassy-embedded-hal",
- "embassy-executor",
- "embassy-futures",
- "embassy-net",
- "embassy-net-wiznet",
- "embassy-rp",
- "embassy-sync",
- "embassy-time",
- "embassy-usb",
- "embassy-usb-logger",
- "embedded-graphics",
- "embedded-hal 1.0.0",
- "embedded-hal-async",
- "embedded-hal-bus",
- "embedded-io-async",
- "embedded-storage",
- "fixed",
- "fixed-macro",
- "futures",
- "heapless 0.8.0",
- "log",
- "panic-probe",
- "pio",
- "pio-proc",
- "portable-atomic",
- "rand",
- "smart-leds",
- "st7789",
- "static_cell",
- "usbd-hid",
 ]
 
 [[package]]

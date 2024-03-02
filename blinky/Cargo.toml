@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 
-range-set-blaze = { path = "../../range-set-blaze", features = ["alloc"], default-features = false}
+range-set-blaze = { version="0.1.16-alpha1", features = ["alloc"], default-features = false}
 
 
 embassy-embedded-hal = { version = "0.1.0", path = "../dependencies/embassy-embedded-hal", features = ["defmt"] }

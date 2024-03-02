@@ -22,7 +22,7 @@ async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let compiled_movies: [RangeMapBlaze<i32, u8>; 3] =
-        [hello_world(), circles(), double_count_down()];
+        [double_count_down(), hello_world(), circles()];
 
     // set pins 0 to 7 for output
     let mut pins = [

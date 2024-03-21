@@ -8,11 +8,10 @@ static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 const HEAP_SIZE: usize = 1024 * 64; // in bytes
 
 use alloc_cortex_m::CortexMHeap;
-use defmt::*;
 use embassy_executor::Spawner;
-use embassy_rp::gpio::{self, AnyPin};
+use embassy_rp::gpio::{self};
 use embassy_time::{Duration, Timer};
-use gpio::{Level, Output};
+use gpio::Level;
 use range_set_blaze::{RangeMapBlaze, RangeSetBlaze};
 use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to your setup
 
@@ -147,6 +146,7 @@ pub fn double_count_down() -> RangeMapBlaze<i32, u8> {
 
 pub struct Leds;
 
+#[allow(dead_code)]
 impl Leds {
     const SEG_A: u8 = 0b00000001;
     const SEG_B: u8 = 0b00000010;

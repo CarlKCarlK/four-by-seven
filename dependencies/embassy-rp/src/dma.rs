@@ -1,6 +1,7 @@
 //! Direct Memory Access (DMA)
 use core::future::Future;
 use core::pin::Pin;
+use core::ptr::addr_of_mut;
 use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::{Context, Poll};
 
@@ -12,6 +13,7 @@ use crate::interrupt::InterruptExt;
 use crate::pac::dma::vals;
 use crate::{interrupt, pac, peripherals};
 
+#[allow(non_snake_case)]
 #[cfg(feature = "rt")]
 #[interrupt]
 fn DMA_IRQ_0() {
@@ -96,7 +98,7 @@ pub unsafe fn write_repeated<'a, C: Channel, W: Word>(
 ) -> Transfer<'a, C> {
     copy_inner(
         ch,
-        &mut DUMMY as *const u32,
+        addr_of_mut!(DUMMY) as *const u32,
         to as *mut u32,
         len,
         W::size(),
@@ -215,7 +217,9 @@ mod sealed {
 }
 
 /// DMA channel interface.
-pub trait Channel: Peripheral<P = Self> + sealed::Channel + Into<AnyChannel> + Sized + 'static {
+pub trait Channel:
+    Peripheral<P = Self> + sealed::Channel + Into<AnyChannel> + Sized + 'static
+{
     /// Channel number.
     fn number(&self) -> u8;
 
@@ -226,7 +230,9 @@ pub trait Channel: Peripheral<P = Self> + sealed::Channel + Into<AnyChannel> + S
 
     /// Convert into type-erased [AnyChannel].
     fn degrade(self) -> AnyChannel {
-        AnyChannel { number: self.number() }
+        AnyChannel {
+            number: self.number(),
+        }
     }
 }
 

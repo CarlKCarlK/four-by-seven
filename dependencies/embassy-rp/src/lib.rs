@@ -270,6 +270,7 @@ select_bootloader! {
 ///     // ...
 /// }
 /// ```
+#[allow(static_mut_refs)]
 pub fn install_core0_stack_guard() -> Result<(), ()> {
     extern "C" {
         static mut _stack_end: usize;

@@ -23,16 +23,23 @@ async fn main(_spawner: Spawner) {
     let compiled_movies: [RangeMapBlaze<i32, u8>; 3] =
         [double_count_down(), hello_world(), circles()];
 
-    // set pins 0 to 7 for output
-    let mut pins = [
-        gpio::Output::new(p.PIN_0, Level::High),
+    let _led_pin = gpio::Output::new(p.PIN_0, Level::Low);
+    let mut digit_pins = [
         gpio::Output::new(p.PIN_1, Level::High),
         gpio::Output::new(p.PIN_2, Level::High),
         gpio::Output::new(p.PIN_3, Level::High),
         gpio::Output::new(p.PIN_4, Level::High),
-        gpio::Output::new(p.PIN_5, Level::High),
-        gpio::Output::new(p.PIN_6, Level::High),
-        gpio::Output::new(p.PIN_7, Level::High),
+    ];
+
+    let mut segment_pins = [
+        gpio::Output::new(p.PIN_5, Level::Low),
+        gpio::Output::new(p.PIN_6, Level::Low),
+        gpio::Output::new(p.PIN_7, Level::Low),
+        gpio::Output::new(p.PIN_8, Level::Low),
+        gpio::Output::new(p.PIN_9, Level::Low),
+        gpio::Output::new(p.PIN_10, Level::Low),
+        gpio::Output::new(p.PIN_11, Level::Low),
+        gpio::Output::new(p.PIN_12, Level::Low),
     ];
 
     let mut movie_index = 0;
@@ -42,7 +49,7 @@ async fn main(_spawner: Spawner) {
 
         for range_values in movie.range_values() {
             let frame = *range_values.value;
-            set_pin_levels(&mut pins, frame);
+            set_pin_levels(&mut digit_pins, &mut segment_pins, frame);
             let (start, end) = range_values.range.into_inner();
             let frame_count = (end + 1 - start) as u64;
             let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
@@ -51,8 +58,17 @@ async fn main(_spawner: Spawner) {
     }
 }
 
-fn set_pin_levels(pins: &mut [gpio::Output; 8], value: u8) {
-    for (i, pin) in pins.iter_mut().enumerate() {
+fn set_pin_levels(
+    digit_pins: &mut [gpio::Output; 4],
+    segment_pins: &mut [gpio::Output; 8],
+    value: u8,
+) {
+    for pin in digit_pins.iter_mut() {
+        pin.set_level(Level::Low);
+    }
+    // digit_pins[0].set_level(Level::Low);
+
+    for (i, pin) in segment_pins.iter_mut().enumerate() {
         pin.set_level(match (value >> i) & 1 {
             1 => Level::High,
             _ => Level::Low,

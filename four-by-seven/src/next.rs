@@ -3,33 +3,32 @@
 
 extern crate alloc;
 
+// use alloc::sync::Arc;
+
 #[global_allocator]
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 const HEAP_SIZE: usize = 1024 * 64; // in bytes
 
 use alloc_cortex_m::CortexMHeap;
-use defmt::unwrap;
 use embassy_executor::Spawner;
-use embassy_rp::gpio;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_sync::mutex::Mutex;
+use embassy_rp::gpio::{self};
+use embassy_sync::blocking_mutex::CriticalSectionMutex;
 use embassy_time::{Duration, Timer};
 use gpio::Level;
 use range_set_blaze::{RangeMapBlaze, RangeSetBlaze};
 use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to your setup
 
-pub struct VirtualDisplay {
+static DISPLAY: CriticalSectionMutex<VirtualDisplay> =
+    CriticalSectionMutex::new(VirtualDisplay::new());
+struct VirtualDisplay {
     digits: [u8; 4],
 }
 
-// default is 255 x 4
-impl Default for VirtualDisplay {
-    fn default() -> Self {
-        VirtualDisplay { digits: [255; 4] }
-    }
-}
-
 impl VirtualDisplay {
+    pub fn new() -> Self {
+        Self { digits: [0; 4] }
+    }
+
     pub fn set_segment(&mut self, digit: usize, segment: u8, state: bool) {
         if digit < 4 && segment < 8 {
             if state {
@@ -48,42 +47,24 @@ impl VirtualDisplay {
 }
 
 #[embassy_executor::task]
-#[allow(clippy::needless_range_loop)]
-async fn multiplex_display() {
-    let p = embassy_rp::init(Default::default());
-
-    let mut digit_pins = [
-        gpio::Output::new(p.PIN_1, Level::High),
-        gpio::Output::new(p.PIN_2, Level::High),
-        gpio::Output::new(p.PIN_3, Level::High),
-        gpio::Output::new(p.PIN_4, Level::High),
-    ];
-
-    let mut segment_pins = [
-        gpio::Output::new(p.PIN_5, Level::Low),
-        gpio::Output::new(p.PIN_6, Level::Low),
-        gpio::Output::new(p.PIN_7, Level::Low),
-        gpio::Output::new(p.PIN_8, Level::Low),
-        gpio::Output::new(p.PIN_9, Level::Low),
-        gpio::Output::new(p.PIN_10, Level::Low),
-        gpio::Output::new(p.PIN_11, Level::Low),
-        gpio::Output::new(p.PIN_12, Level::Low),
-    ];
+async fn multiplex_display(
+    mut digit_pins: [gpio::Output<'static>; 4],
+    mut segment_pins: [gpio::Output<'static>; 8],
+) {
     loop {
         for digit_idx in 0..4 {
-            // cmk const
-
             {
-                // inner scope to release the lock
-                let virtual_display = MUTEX_DISPLAY.lock().await;
-                let virtual_display = virtual_display.as_ref().unwrap();
-                for (segment_idx, segment_pin) in segment_pins.iter_mut().enumerate() {
-                    if (virtual_display.digits[digit_idx] >> segment_idx) & 1 == 1 {
-                        segment_pin.set_high();
-                    } else {
-                        segment_pin.set_low();
+                // Lock the display until the end of this block
+                DISPLAY.lock(|display| {
+                    // Set segments for current digit
+                    for (segment_idx, segment_pin) in segment_pins.iter_mut().enumerate() {
+                        if (display.digits[digit_idx] >> segment_idx) & 1 == 1 {
+                            segment_pin.set_high();
+                        } else {
+                            segment_pin.set_low();
+                        }
                     }
-                }
+                });
             }
 
             // Activate current digit
@@ -97,83 +78,72 @@ async fn multiplex_display() {
     }
 }
 
-type MutexDisplay = Mutex<ThreadModeRawMutex, Option<VirtualDisplay>>;
-static MUTEX_DISPLAY: MutexDisplay = Mutex::new(None);
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
-
-    {
-        let mut mutex_display = MUTEX_DISPLAY.lock().await;
-        *mutex_display = Some(VirtualDisplay::default());
-    }
+    let p = embassy_rp::init(Default::default());
 
     let compiled_movies: [RangeMapBlaze<i32, u8>; 3] =
         [double_count_down(), hello_world(), circles()];
 
-    // let _led_pin = gpio::Output::new(p.PIN_0, Level::Low);
+    let _led_pin = gpio::Output::new(p.PIN_0, Level::Low);
+    let digit_pins = [
+        gpio::Output::new(p.PIN_1, Level::High),
+        gpio::Output::new(p.PIN_2, Level::High),
+        gpio::Output::new(p.PIN_3, Level::High),
+        gpio::Output::new(p.PIN_4, Level::High),
+    ];
 
-    unwrap!(spawner.spawn(multiplex_display()));
+    let segment_pins = [
+        gpio::Output::new(p.PIN_5, Level::Low),
+        gpio::Output::new(p.PIN_6, Level::Low),
+        gpio::Output::new(p.PIN_7, Level::Low),
+        gpio::Output::new(p.PIN_8, Level::Low),
+        gpio::Output::new(p.PIN_9, Level::Low),
+        gpio::Output::new(p.PIN_10, Level::Low),
+        gpio::Output::new(p.PIN_11, Level::Low),
+        gpio::Output::new(p.PIN_12, Level::Low),
+    ];
+
+    spawner
+        .spawn(multiplex_display(digit_pins, segment_pins))
+        .unwrap();
 
     let mut movie_index = 0;
-    let mut digit = 0;
     loop {
         let movie = &compiled_movies[movie_index];
         movie_index = (movie_index + 1) % compiled_movies.len();
 
         for range_values in movie.range_values() {
             let frame = *range_values.value;
-            {
-                // inner scope to release the lock
-                let mut virtual_display: embassy_sync::mutex::MutexGuard<
-                    '_,
-                    ThreadModeRawMutex,
-                    Option<VirtualDisplay>,
-                > = MUTEX_DISPLAY.lock().await;
-                let virtual_display = virtual_display.as_mut().unwrap();
-                virtual_display.set_digit(digit, frame);
-            }
+            DISPLAY.lock(|display| {
+                display.set_digit(0, frame);
+            });
             let (start, end) = range_values.range.into_inner();
             let frame_count = (end + 1 - start) as u64;
             let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
             Timer::after(duration).await;
-            digit = (digit + 1) % 4;
         }
     }
-
-    // let mut movie_index = 0;
-    // loop {
-    //     let movie = &compiled_movies[movie_index];
-    //     movie_index = (movie_index + 1) % compiled_movies.len();
-
-    //     for range_values in movie.range_values() {
-    //         let frame = *range_values.value;
-    //         set_pin_levels(&mut digit_pins, &mut segment_pins, frame);
-    //         let (start, end) = range_values.range.into_inner();
-    //         let frame_count = (end + 1 - start) as u64;
-    //         let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
-    //         Timer::after(duration).await;
-    //     }
 }
 
-fn set_pin_levels(
-    digit_pins: &mut [gpio::Output; 4],
-    segment_pins: &mut [gpio::Output; 8],
-    value: u8,
-) {
-    for pin in digit_pins.iter_mut() {
-        pin.set_level(Level::Low);
-    }
-    // digit_pins[0].set_level(Level::Low);
+// fn set_pin_levels(
+//     digit_pins: &mut [gpio::Output; 4],
+//     segment_pins: &mut [gpio::Output; 8],
+//     value: u8,
+// ) {
+//     for pin in digit_pins.iter_mut() {
+//         pin.set_level(Level::Low);
+//     }
+//     // digit_pins[0].set_level(Level::Low);
 
-    for (i, pin) in segment_pins.iter_mut().enumerate() {
-        pin.set_level(match (value >> i) & 1 {
-            1 => Level::High,
-            _ => Level::Low,
-        });
-    }
-}
+//     for (i, pin) in segment_pins.iter_mut().enumerate() {
+//         pin.set_level(match (value >> i) & 1 {
+//             1 => Level::High,
+//             _ => Level::Low,
+//         });
+//     }
+// }
 
 const FPS: i32 = 24;
 

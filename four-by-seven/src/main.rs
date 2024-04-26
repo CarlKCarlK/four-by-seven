@@ -112,15 +112,15 @@ async fn main(spawner: Spawner) {
         *mutex_display = Some(VirtualDisplay::default());
     }
 
-    let compiled_movies: [RangeMapBlaze<i32, u8>; 3] =
-        [double_count_down(), hello_world(), circles()];
+    // let compiled_movies: [RangeMapBlaze<i32, u8>; 3] =
+    //     [double_count_down(), hello_world(), circles()];
+    let compiled_movies: [RangeMapBlaze<i32, [u8; 4]>; 2] = [circles_wide(), hello_world_wide()];
 
     // let _led_pin = gpio::Output::new(p.PIN_0, Level::Low);
 
     unwrap!(spawner.spawn(multiplex_display()));
 
     let mut movie_index = 0;
-    let mut digit = 0;
     loop {
         let movie = &compiled_movies[movie_index];
         movie_index = (movie_index + 1) % compiled_movies.len();
@@ -135,50 +135,67 @@ async fn main(spawner: Spawner) {
                     Option<VirtualDisplay>,
                 > = MUTEX_DISPLAY.lock().await;
                 let virtual_display = virtual_display.as_mut().unwrap();
-                virtual_display.set_digit(digit, frame);
+                for (digit, sub_frame) in frame.iter().enumerate() {
+                    virtual_display.set_digit(digit, *sub_frame);
+                }
             }
             let (start, end) = range_values.range.into_inner();
             let frame_count = (end + 1 - start) as u64;
             let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
             Timer::after(duration).await;
-            digit = (digit + 1) % 4;
         }
     }
-
-    // let mut movie_index = 0;
-    // loop {
-    //     let movie = &compiled_movies[movie_index];
-    //     movie_index = (movie_index + 1) % compiled_movies.len();
-
-    //     for range_values in movie.range_values() {
-    //         let frame = *range_values.value;
-    //         set_pin_levels(&mut digit_pins, &mut segment_pins, frame);
-    //         let (start, end) = range_values.range.into_inner();
-    //         let frame_count = (end + 1 - start) as u64;
-    //         let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
-    //         Timer::after(duration).await;
-    //     }
 }
 
-fn set_pin_levels(
-    digit_pins: &mut [gpio::Output; 4],
-    segment_pins: &mut [gpio::Output; 8],
-    value: u8,
-) {
-    for pin in digit_pins.iter_mut() {
-        pin.set_level(Level::Low);
-    }
-    // digit_pins[0].set_level(Level::Low);
+// fn set_pin_levels(
+//     digit_pins: &mut [gpio::Output; 4],
+//     segment_pins: &mut [gpio::Output; 8],
+//     value: u8,
+// ) {
+//     for pin in digit_pins.iter_mut() {
+//         pin.set_level(Level::Low);
+//     }
+//     // digit_pins[0].set_level(Level::Low);
 
-    for (i, pin) in segment_pins.iter_mut().enumerate() {
-        pin.set_level(match (value >> i) & 1 {
-            1 => Level::High,
-            _ => Level::Low,
-        });
-    }
-}
+//     for (i, pin) in segment_pins.iter_mut().enumerate() {
+//         pin.set_level(match (value >> i) & 1 {
+//             1 => Level::High,
+//             _ => Level::Low,
+//         });
+//     }
+// }
 
 const FPS: i32 = 24;
+
+fn line_to_u8_array(line: &str) -> [u8; 4] {
+    let mut result = [0; 4];
+    for (i, c) in line.chars().enumerate() {
+        // cmk could try to go out of the array
+        result[i] = Leds::ASCII_TABLE[c as usize];
+    }
+    result
+}
+
+pub fn hello_world_wide() -> RangeMapBlaze<i32, [u8; 4]> {
+    let message = "3\n 2\n  1\n\n   H\n  He\n Hel\nHell\nello\nllo\nlo W\no Wo\n Wor\nWorl\norld\nrld\nld\nd\n";
+    let message: RangeMapBlaze<i32, _> = message
+        .lines()
+        .enumerate()
+        .map(|(i, line)| (i as i32, line_to_u8_array(line)))
+        .collect();
+    let message = linear_wide(&message, FPS, 0);
+    // add gaps of 3 frames between each character
+    let message = message
+        .range_values()
+        .enumerate()
+        .map(|(i, range_value)| {
+            let (start, end) = range_value.range.clone().into_inner();
+            let new_range = start + i as i32 * 3..=end + i as i32 * 3;
+            (new_range, range_value.value)
+        })
+        .collect();
+    message
+}
 
 pub fn hello_world() -> RangeMapBlaze<i32, u8> {
     let message = "321 Hello world!";
@@ -200,6 +217,40 @@ pub fn hello_world() -> RangeMapBlaze<i32, u8> {
         .collect();
     message
 }
+
+pub fn circles_wide() -> RangeMapBlaze<i32, [u8; 4]> {
+    // Light up segments A to F
+    let circle = RangeMapBlaze::from_iter([
+        (0, [0, 0, 0, Leds::SEG_A]),
+        (1, [0, 0, 0, Leds::SEG_B]),
+        (2, [0, 0, 0, Leds::SEG_C]),
+        (3, [0, 0, 0, Leds::SEG_D]),
+        (4, [0, 0, Leds::SEG_D, 0]),
+        (5, [0, Leds::SEG_D, 0, 0]),
+        (6, [Leds::SEG_D, 0, 0, 0]),
+        (7, [Leds::SEG_E, 0, 0, 0]),
+        (8, [Leds::SEG_F, 0, 0, 0]),
+        (9, [Leds::SEG_A, 0, 0, 0]),
+        (10, [0, Leds::SEG_A, 0, 0]),
+        (11, [0, 0, Leds::SEG_A, 0]),
+    ]);
+    let mut main = RangeMapBlaze::new();
+    let mut scale = 1;
+    while scale < 24 {
+        // Slow down the circle by a factor of 1 to 24, appending to `main` each time.
+        main = &main | linear_wide(&circle, scale, main.len() as i32);
+        scale *= 2;
+    }
+    // append main with itself, but reversed
+    main = &main | linear_wide(&main, -1, main.len() as i32);
+
+    // append 10 copies of the fast circle
+    for _ in 0..20 {
+        main = &main | linear_wide(&circle, -1, main.len() as i32);
+    }
+    main
+}
+
 pub fn circles() -> RangeMapBlaze<i32, u8> {
     // Light up segments A to F
     let circle = RangeMapBlaze::from_iter([
@@ -410,6 +461,34 @@ pub fn linear(
     scale: i32,
     shift: i32,
 ) -> RangeMapBlaze<i32, u8> {
+    if range_map_blaze.is_empty() {
+        return RangeMapBlaze::new();
+    }
+
+    let first = range_map_blaze.first_key_value().unwrap().0;
+    let last = range_map_blaze.last_key_value().unwrap().0;
+
+    range_map_blaze
+        .range_values()
+        .map(|range_value| {
+            let (start, end) = range_value.range.clone().into_inner();
+            let mut a = (start - first) * scale.abs() + first;
+            let mut b = (end + 1 - first) * scale.abs() + first - 1;
+            let last = (last + 1 - first) * scale.abs() + first - 1;
+            if scale < 0 {
+                (a, b) = (last - b + first, last - a + first);
+            }
+            let new_range = a + shift..=b + shift;
+            (new_range, range_value.value)
+        })
+        .collect()
+}
+
+pub fn linear_wide(
+    range_map_blaze: &RangeMapBlaze<i32, [u8; 4]>,
+    scale: i32,
+    shift: i32,
+) -> RangeMapBlaze<i32, [u8; 4]> {
     if range_map_blaze.is_empty() {
         return RangeMapBlaze::new();
     }

@@ -50,7 +50,7 @@ impl VirtualDisplay {
 #[embassy_executor::task]
 #[allow(clippy::needless_range_loop)]
 async fn multiplex_display() {
-    let p = embassy_rp::init(Default::default());
+    let p: embassy_rp::Peripherals = embassy_rp::init(Default::default());
 
     let mut digit_pins = [
         gpio::Output::new(p.PIN_1, Level::High),
@@ -99,6 +99,9 @@ async fn multiplex_display() {
 
 type MutexDisplay = Mutex<ThreadModeRawMutex, Option<VirtualDisplay>>;
 static MUTEX_DISPLAY: MutexDisplay = Mutex::new(None);
+
+// cmk must use Option<VirtualDisplay> instead of VirtualDisplay?
+// Can we have Peripherals define elsewhere so we use the other led and the button
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {

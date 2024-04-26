@@ -14,6 +14,7 @@ use embassy_rp::gpio;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
+use embedded_hal_1::digital::OutputPin;
 use gpio::Level;
 use range_set_blaze::{RangeMapBlaze, RangeSetBlaze};
 use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to your setup
@@ -31,6 +32,7 @@ impl Default for VirtualDisplay {
 
 impl VirtualDisplay {
     pub fn set_segment(&mut self, digit: usize, segment: u8, state: bool) {
+        // cmk would be nice if didn't have to guard against out of range
         if digit < 4 && segment < 8 {
             if state {
                 self.digits[digit] |= 1 << segment;
@@ -70,33 +72,31 @@ async fn multiplex_display() {
         gpio::Output::new(p.PIN_12, Level::Low),
     ];
     loop {
+        // cmk const
         for digit_idx in 0..4 {
-            // cmk const
-
             {
                 // inner scope to release the lock
+                // cmk other versions of MUTEX use a closure
                 let virtual_display = MUTEX_DISPLAY.lock().await;
                 let virtual_display = virtual_display.as_ref().unwrap();
+                // cmk would be nice to move some of this iteration and bit shifting to the VirtualDisplay
                 for (segment_idx, segment_pin) in segment_pins.iter_mut().enumerate() {
-                    if (virtual_display.digits[digit_idx] >> segment_idx) & 1 == 1 {
-                        segment_pin.set_high();
-                    } else {
-                        segment_pin.set_low();
-                    }
+                    segment_pin
+                        .set_state(
+                            ((virtual_display.digits[digit_idx] >> segment_idx) & 1 == 1).into(),
+                        )
+                        .unwrap();
                 }
             }
-
-            // Activate current digit
+            // Activate and deactivate the digit
             digit_pins[digit_idx].set_low(); // Assuming common cathode setup
-
             Timer::after(Duration::from_millis(5)).await;
-
-            // Deactivate digit
             digit_pins[digit_idx].set_high();
         }
     }
 }
 
+// cmk would be nice to wrap the u8 used for LED segments
 type MutexDisplay = Mutex<ThreadModeRawMutex, Option<VirtualDisplay>>;
 static MUTEX_DISPLAY: MutexDisplay = Mutex::new(None);
 
@@ -112,10 +112,9 @@ async fn main(spawner: Spawner) {
         *mutex_display = Some(VirtualDisplay::default());
     }
 
-    // let compiled_movies: [RangeMapBlaze<i32, u8>; 3] =
-    //     [double_count_down(), hello_world(), circles()];
     let compiled_movies: [RangeMapBlaze<i32, [u8; 4]>; 2] = [circles_wide(), hello_world_wide()];
 
+    // cmk Can't access this pin because don't have access to Peripherals, here
     // let _led_pin = gpio::Output::new(p.PIN_0, Level::Low);
 
     unwrap!(spawner.spawn(multiplex_display()));
@@ -129,11 +128,7 @@ async fn main(spawner: Spawner) {
             let frame = *range_values.value;
             {
                 // inner scope to release the lock
-                let mut virtual_display: embassy_sync::mutex::MutexGuard<
-                    '_,
-                    ThreadModeRawMutex,
-                    Option<VirtualDisplay>,
-                > = MUTEX_DISPLAY.lock().await;
+                let mut virtual_display = MUTEX_DISPLAY.lock().await;
                 let virtual_display = virtual_display.as_mut().unwrap();
                 for (digit, sub_frame) in frame.iter().enumerate() {
                     virtual_display.set_digit(digit, *sub_frame);
@@ -146,24 +141,6 @@ async fn main(spawner: Spawner) {
         }
     }
 }
-
-// fn set_pin_levels(
-//     digit_pins: &mut [gpio::Output; 4],
-//     segment_pins: &mut [gpio::Output; 8],
-//     value: u8,
-// ) {
-//     for pin in digit_pins.iter_mut() {
-//         pin.set_level(Level::Low);
-//     }
-//     // digit_pins[0].set_level(Level::Low);
-
-//     for (i, pin) in segment_pins.iter_mut().enumerate() {
-//         pin.set_level(match (value >> i) & 1 {
-//             1 => Level::High,
-//             _ => Level::Low,
-//         });
-//     }
-// }
 
 const FPS: i32 = 24;
 

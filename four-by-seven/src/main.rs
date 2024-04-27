@@ -15,6 +15,7 @@ use core::{
 use alloc_cortex_m::CortexMHeap;
 use defmt::unwrap;
 use embassy_executor::Spawner;
+use embassy_futures::join::join;
 use embassy_rp::gpio;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -150,11 +151,13 @@ async fn track_button() {
     let led0_pin = led0_pin.as_mut().unwrap();
 
     loop {
+        button_pin.wait_for_any_edge().await;
         led0_pin.set_state(button_pin.is_high().into()).unwrap();
         Timer::after(Duration::from_millis(5)).await;
     }
 }
 
+// cmk use static_cell for these? See https://github.com/embassy-rs/embassy/blob/main/examples/rp/src/bin/multicore.rs
 static DIGIT_PINS: Mutex<ThreadModeRawMutex, Option<[gpio::Output; 4]>> = Mutex::new(None);
 static SEGMENT_PINS: Mutex<ThreadModeRawMutex, Option<[gpio::Output; 8]>> = Mutex::new(None);
 static BUTTON_PIN: Mutex<ThreadModeRawMutex, Option<gpio::Input>> = Mutex::new(None);
@@ -197,8 +200,7 @@ async fn init_static_peripherals() {
 async fn main(spawner: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
 
-    init_static_peripherals().await;
-    VIRTUAL_DISPLAY.init().await;
+    join(init_static_peripherals(), VIRTUAL_DISPLAY.init()).await;
 
     unwrap!(spawner.spawn(multiplex_display()));
     unwrap!(spawner.spawn(track_button()));

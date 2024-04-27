@@ -26,24 +26,49 @@ use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to y
 
 pub const DIGIT_COUNT: usize = 4;
 
-// cmk would be nice to wrap the u8 used for LED segments
-type MutexDisplay = Mutex<ThreadModeRawMutex, Option<VirtualDisplay>>;
-static MUTEX_DISPLAY: MutexDisplay = Mutex::new(None);
-
 pub struct VirtualDisplay {
+    mutex_digits: Mutex<ThreadModeRawMutex, Option<DigitArray>>,
+}
+
+static VIRTUAL_DISPLAY: VirtualDisplay = VirtualDisplay {
+    mutex_digits: Mutex::new(None),
+};
+
+impl VirtualDisplay {
+    async fn init(&'static self) {
+        let mut mutex_digits = VIRTUAL_DISPLAY.mutex_digits.lock().await;
+        *mutex_digits = Some(DigitArray::default());
+    }
+
+    async fn bool_iter(&'static self, digit_index: usize) -> array::IntoIter<bool, 8> {
+        // inner scope to release the lock
+        // cmk other versions of MUTEX use a closure
+        let digit_array = self.mutex_digits.lock().await;
+        let digit_array = digit_array.as_ref().unwrap();
+        digit_array.bool_iter(digit_index)
+    }
+
+    async fn set_all_digits(&'static self, all: [u8; DIGIT_COUNT]) {
+        let mut digit_array = VIRTUAL_DISPLAY.mutex_digits.lock().await;
+        let digit_array = digit_array.as_mut().unwrap();
+        digit_array.set_all_digits(&all);
+    }
+}
+
+pub struct DigitArray {
     digits: [u8; DIGIT_COUNT],
 }
 
 // default is 255 x DIGIT_COUNT
-impl Default for VirtualDisplay {
+impl Default for DigitArray {
     fn default() -> Self {
-        VirtualDisplay {
+        DigitArray {
             digits: [255; DIGIT_COUNT],
         }
     }
 }
 
-impl Index<usize> for VirtualDisplay {
+impl Index<usize> for DigitArray {
     type Output = u8;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -51,13 +76,13 @@ impl Index<usize> for VirtualDisplay {
     }
 }
 
-impl IndexMut<usize> for VirtualDisplay {
+impl IndexMut<usize> for DigitArray {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.digits[index]
     }
 }
 
-impl VirtualDisplay {
+impl DigitArray {
     pub fn set_segment(&mut self, digit: usize, segment: usize, state: bool) {
         assert!(segment < 8, "segment out of range");
         if state {
@@ -89,20 +114,6 @@ impl VirtualDisplay {
     }
 }
 
-async fn bool_iter(digit_index: usize) -> array::IntoIter<bool, 8> {
-    // inner scope to release the lock
-    // cmk other versions of MUTEX use a closure
-    let virtual_display = MUTEX_DISPLAY.lock().await;
-    let virtual_display = virtual_display.as_ref().unwrap();
-    virtual_display.bool_iter(digit_index)
-}
-
-async fn set_all_digits(frame: [u8; DIGIT_COUNT]) {
-    let mut virtual_display = MUTEX_DISPLAY.lock().await;
-    let virtual_display = virtual_display.as_mut().unwrap();
-    virtual_display.set_all_digits(&frame);
-}
-
 #[embassy_executor::task]
 #[allow(clippy::needless_range_loop)]
 async fn multiplex_display() {
@@ -126,9 +137,9 @@ async fn multiplex_display() {
         gpio::Output::new(p.PIN_12, Level::Low),
     ];
     loop {
-        // cmk const
         for digit_index in 0..DIGIT_COUNT {
-            bool_iter(digit_index)
+            VIRTUAL_DISPLAY
+                .bool_iter(digit_index)
                 .await
                 .zip(segment_pins.iter_mut())
                 .for_each(|(state, segment_pin)| {
@@ -142,17 +153,14 @@ async fn multiplex_display() {
     }
 }
 
-// cmk must use Option<VirtualDisplay> instead of VirtualDisplay?
+// cmk must use Option<DigitArray> instead of DigitArray?
 // Can we have Peripherals define elsewhere so we use the other led and the button
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
 
-    {
-        let mut mutex_display = MUTEX_DISPLAY.lock().await;
-        *mutex_display = Some(VirtualDisplay::default());
-    }
+    VIRTUAL_DISPLAY.init().await;
 
     let compiled_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] =
         [circles_wide(), hello_world_wide()];
@@ -168,8 +176,14 @@ async fn main(spawner: Spawner) {
         movie_index = (movie_index + 1) % compiled_movies.len();
 
         for range_values in movie.range_values() {
-            set_all_digits(*range_values.value).await;
+            // Get the next frame of the animation (and its duration)
             let (start, end) = range_values.range.into_inner();
+            let frame = *range_values.value;
+
+            // Display this frame
+            VIRTUAL_DISPLAY.set_all_digits(frame).await;
+
+            // Show this frame for the correct duration
             let frame_count = (end + 1 - start) as u64;
             let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
             Timer::after(duration).await;

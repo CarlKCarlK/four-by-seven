@@ -117,25 +117,12 @@ impl DigitArray {
 #[embassy_executor::task]
 #[allow(clippy::needless_range_loop)]
 async fn multiplex_display() {
-    let p: embassy_rp::Peripherals = embassy_rp::init(Default::default());
+    // hold these forever
+    let mut digit_pins = DIGIT_PINS.lock().await;
+    let digit_pins = digit_pins.as_mut().unwrap();
+    let mut segment_pins = SEGMENT_PINS.lock().await;
+    let segment_pins = segment_pins.as_mut().unwrap();
 
-    let mut digit_pins = [
-        gpio::Output::new(p.PIN_1, Level::High),
-        gpio::Output::new(p.PIN_2, Level::High),
-        gpio::Output::new(p.PIN_3, Level::High),
-        gpio::Output::new(p.PIN_4, Level::High),
-    ];
-
-    let mut segment_pins = [
-        gpio::Output::new(p.PIN_5, Level::Low),
-        gpio::Output::new(p.PIN_6, Level::Low),
-        gpio::Output::new(p.PIN_7, Level::Low),
-        gpio::Output::new(p.PIN_8, Level::Low),
-        gpio::Output::new(p.PIN_9, Level::Low),
-        gpio::Output::new(p.PIN_10, Level::Low),
-        gpio::Output::new(p.PIN_11, Level::Low),
-        gpio::Output::new(p.PIN_12, Level::Low),
-    ];
     loop {
         for digit_index in 0..DIGIT_COUNT {
             VIRTUAL_DISPLAY
@@ -153,12 +140,40 @@ async fn multiplex_display() {
     }
 }
 
+static DIGIT_PINS: Mutex<ThreadModeRawMutex, Option<[gpio::Output; 4]>> = Mutex::new(None);
+static SEGMENT_PINS: Mutex<ThreadModeRawMutex, Option<[gpio::Output; 8]>> = Mutex::new(None);
+
+async fn initialize_peripherals(p: embassy_rp::Peripherals) {
+    let mut digit_pins = DIGIT_PINS.lock().await;
+    *digit_pins = Some([
+        gpio::Output::new(p.PIN_1, Level::High),
+        gpio::Output::new(p.PIN_2, Level::High),
+        gpio::Output::new(p.PIN_3, Level::High),
+        gpio::Output::new(p.PIN_4, Level::High),
+    ]);
+
+    let mut segment_pins = SEGMENT_PINS.lock().await;
+    *segment_pins = Some([
+        gpio::Output::new(p.PIN_5, Level::Low),
+        gpio::Output::new(p.PIN_6, Level::Low),
+        gpio::Output::new(p.PIN_7, Level::Low),
+        gpio::Output::new(p.PIN_8, Level::Low),
+        gpio::Output::new(p.PIN_9, Level::Low),
+        gpio::Output::new(p.PIN_10, Level::Low),
+        gpio::Output::new(p.PIN_11, Level::Low),
+        gpio::Output::new(p.PIN_12, Level::Low),
+    ]);
+}
+
 // cmk must use Option<DigitArray> instead of DigitArray?
 // Can we have Peripherals define elsewhere so we use the other led and the button
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
+
+    let p: embassy_rp::Peripherals = embassy_rp::init(Default::default());
+    initialize_peripherals(p).await;
 
     VIRTUAL_DISPLAY.init().await;
 

@@ -7,6 +7,11 @@ extern crate alloc;
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 const HEAP_SIZE: usize = 1024 * 64; // in bytes
 
+use core::{
+    array,
+    ops::{Index, IndexMut},
+};
+
 use alloc_cortex_m::CortexMHeap;
 use defmt::unwrap;
 use embassy_executor::Spawner;
@@ -19,34 +24,83 @@ use gpio::Level;
 use range_set_blaze::{RangeMapBlaze, RangeSetBlaze};
 use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to your setup
 
+pub const DIGIT_COUNT: usize = 4;
+
+// cmk would be nice to wrap the u8 used for LED segments
+type MutexDisplay = Mutex<ThreadModeRawMutex, Option<VirtualDisplay>>;
+static MUTEX_DISPLAY: MutexDisplay = Mutex::new(None);
+
 pub struct VirtualDisplay {
-    digits: [u8; 4],
+    digits: [u8; DIGIT_COUNT],
 }
 
-// default is 255 x 4
+// default is 255 x DIGIT_COUNT
 impl Default for VirtualDisplay {
     fn default() -> Self {
-        VirtualDisplay { digits: [255; 4] }
+        VirtualDisplay {
+            digits: [255; DIGIT_COUNT],
+        }
+    }
+}
+
+impl Index<usize> for VirtualDisplay {
+    type Output = u8;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.digits[index]
+    }
+}
+
+impl IndexMut<usize> for VirtualDisplay {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.digits[index]
     }
 }
 
 impl VirtualDisplay {
-    pub fn set_segment(&mut self, digit: usize, segment: u8, state: bool) {
-        // cmk would be nice if didn't have to guard against out of range
-        if digit < 4 && segment < 8 {
-            if state {
-                self.digits[digit] |= 1 << segment;
-            } else {
-                self.digits[digit] &= !(1 << segment);
-            }
+    pub fn set_segment(&mut self, digit: usize, segment: usize, state: bool) {
+        assert!(segment < 8, "segment out of range");
+        if state {
+            self[digit] |= 1 << segment;
+        } else {
+            self[digit] &= !(1 << segment);
         }
     }
 
-    pub fn set_digit(&mut self, digit: usize, value: u8) {
-        if digit < 4 {
-            self.digits[digit] = value;
+    pub fn segment(&self, digit: usize, segment: usize) -> bool {
+        assert!(segment < 8, "segment out of range");
+        (self[digit] >> segment) & 1 == 1
+    }
+
+    pub fn set_all_digits(&mut self, &all: &[u8; DIGIT_COUNT]) {
+        for (digit_index, value) in all.iter().enumerate() {
+            self[digit_index] = *value;
         }
     }
+
+    pub fn bool_iter(&self, digit: usize) -> array::IntoIter<bool, 8> {
+        let mut value: u8 = self[digit];
+        let mut arr = [false; 8];
+        for item in arr.iter_mut() {
+            *item = value & 1 == 1;
+            value >>= 1;
+        }
+        arr.into_iter()
+    }
+}
+
+async fn bool_iter(digit_index: usize) -> array::IntoIter<bool, 8> {
+    // inner scope to release the lock
+    // cmk other versions of MUTEX use a closure
+    let virtual_display = MUTEX_DISPLAY.lock().await;
+    let virtual_display = virtual_display.as_ref().unwrap();
+    virtual_display.bool_iter(digit_index)
+}
+
+async fn set_all_digits(frame: [u8; DIGIT_COUNT]) {
+    let mut virtual_display = MUTEX_DISPLAY.lock().await;
+    let virtual_display = virtual_display.as_mut().unwrap();
+    virtual_display.set_all_digits(&frame);
 }
 
 #[embassy_executor::task]
@@ -73,32 +127,20 @@ async fn multiplex_display() {
     ];
     loop {
         // cmk const
-        for digit_idx in 0..4 {
-            {
-                // inner scope to release the lock
-                // cmk other versions of MUTEX use a closure
-                let virtual_display = MUTEX_DISPLAY.lock().await;
-                let virtual_display = virtual_display.as_ref().unwrap();
-                // cmk would be nice to move some of this iteration and bit shifting to the VirtualDisplay
-                for (segment_idx, segment_pin) in segment_pins.iter_mut().enumerate() {
-                    segment_pin
-                        .set_state(
-                            ((virtual_display.digits[digit_idx] >> segment_idx) & 1 == 1).into(),
-                        )
-                        .unwrap();
-                }
-            }
+        for digit_index in 0..DIGIT_COUNT {
+            bool_iter(digit_index)
+                .await
+                .zip(segment_pins.iter_mut())
+                .for_each(|(state, segment_pin)| {
+                    segment_pin.set_state(state.into()).unwrap();
+                });
             // Activate and deactivate the digit
-            digit_pins[digit_idx].set_low(); // Assuming common cathode setup
+            digit_pins[digit_index].set_low(); // Assuming common cathode setup
             Timer::after(Duration::from_millis(5)).await;
-            digit_pins[digit_idx].set_high();
+            digit_pins[digit_index].set_high();
         }
     }
 }
-
-// cmk would be nice to wrap the u8 used for LED segments
-type MutexDisplay = Mutex<ThreadModeRawMutex, Option<VirtualDisplay>>;
-static MUTEX_DISPLAY: MutexDisplay = Mutex::new(None);
 
 // cmk must use Option<VirtualDisplay> instead of VirtualDisplay?
 // Can we have Peripherals define elsewhere so we use the other led and the button
@@ -112,7 +154,8 @@ async fn main(spawner: Spawner) {
         *mutex_display = Some(VirtualDisplay::default());
     }
 
-    let compiled_movies: [RangeMapBlaze<i32, [u8; 4]>; 2] = [circles_wide(), hello_world_wide()];
+    let compiled_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] =
+        [circles_wide(), hello_world_wide()];
 
     // cmk Can't access this pin because don't have access to Peripherals, here
     // let _led_pin = gpio::Output::new(p.PIN_0, Level::Low);
@@ -125,15 +168,7 @@ async fn main(spawner: Spawner) {
         movie_index = (movie_index + 1) % compiled_movies.len();
 
         for range_values in movie.range_values() {
-            let frame = *range_values.value;
-            {
-                // inner scope to release the lock
-                let mut virtual_display = MUTEX_DISPLAY.lock().await;
-                let virtual_display = virtual_display.as_mut().unwrap();
-                for (digit, sub_frame) in frame.iter().enumerate() {
-                    virtual_display.set_digit(digit, *sub_frame);
-                }
-            }
+            set_all_digits(*range_values.value).await;
             let (start, end) = range_values.range.into_inner();
             let frame_count = (end + 1 - start) as u64;
             let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
@@ -144,8 +179,8 @@ async fn main(spawner: Spawner) {
 
 const FPS: i32 = 24;
 
-fn line_to_u8_array(line: &str) -> [u8; 4] {
-    let mut result = [0; 4];
+fn line_to_u8_array(line: &str) -> [u8; DIGIT_COUNT] {
+    let mut result = [0; DIGIT_COUNT];
     for (i, c) in line.chars().enumerate() {
         // cmk could try to go out of the array
         result[i] = Leds::ASCII_TABLE[c as usize];
@@ -153,7 +188,7 @@ fn line_to_u8_array(line: &str) -> [u8; 4] {
     result
 }
 
-pub fn hello_world_wide() -> RangeMapBlaze<i32, [u8; 4]> {
+pub fn hello_world_wide() -> RangeMapBlaze<i32, [u8; DIGIT_COUNT]> {
     let message = "3\n 2\n  1\n\n   H\n  He\n Hel\nHell\nello\nllo\nlo W\no Wo\n Wor\nWorl\norld\nrld\nld\nd\n";
     let message: RangeMapBlaze<i32, _> = message
         .lines()
@@ -195,7 +230,7 @@ pub fn hello_world() -> RangeMapBlaze<i32, u8> {
     message
 }
 
-pub fn circles_wide() -> RangeMapBlaze<i32, [u8; 4]> {
+pub fn circles_wide() -> RangeMapBlaze<i32, [u8; DIGIT_COUNT]> {
     // Light up segments A to F
     let circle = RangeMapBlaze::from_iter([
         (0, [0, 0, 0, Leds::SEG_A]),
@@ -462,10 +497,10 @@ pub fn linear(
 }
 
 pub fn linear_wide(
-    range_map_blaze: &RangeMapBlaze<i32, [u8; 4]>,
+    range_map_blaze: &RangeMapBlaze<i32, [u8; DIGIT_COUNT]>,
     scale: i32,
     shift: i32,
-) -> RangeMapBlaze<i32, [u8; 4]> {
+) -> RangeMapBlaze<i32, [u8; DIGIT_COUNT]> {
     if range_map_blaze.is_empty() {
         return RangeMapBlaze::new();
     }

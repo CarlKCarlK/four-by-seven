@@ -140,10 +140,29 @@ async fn multiplex_display() {
     }
 }
 
+#[embassy_executor::task]
+#[allow(clippy::needless_range_loop)]
+async fn track_button() {
+    // hold these forever
+    let mut button_pin = BUTTON_PIN.lock().await;
+    let button_pin = button_pin.as_mut().unwrap();
+    let mut led0_pin = LED0_PIN.lock().await;
+    let led0_pin = led0_pin.as_mut().unwrap();
+
+    loop {
+        led0_pin.set_state(button_pin.is_high().into()).unwrap();
+        Timer::after(Duration::from_millis(5)).await;
+    }
+}
+
 static DIGIT_PINS: Mutex<ThreadModeRawMutex, Option<[gpio::Output; 4]>> = Mutex::new(None);
 static SEGMENT_PINS: Mutex<ThreadModeRawMutex, Option<[gpio::Output; 8]>> = Mutex::new(None);
+static BUTTON_PIN: Mutex<ThreadModeRawMutex, Option<gpio::Input>> = Mutex::new(None);
+static LED0_PIN: Mutex<ThreadModeRawMutex, Option<gpio::Output>> = Mutex::new(None);
 
-async fn initialize_peripherals(p: embassy_rp::Peripherals) {
+async fn init_static_peripherals() {
+    let p: embassy_rp::Peripherals = embassy_rp::init(Default::default());
+
     let mut digit_pins = DIGIT_PINS.lock().await;
     *digit_pins = Some([
         gpio::Output::new(p.PIN_1, Level::High),
@@ -163,6 +182,12 @@ async fn initialize_peripherals(p: embassy_rp::Peripherals) {
         gpio::Output::new(p.PIN_11, Level::Low),
         gpio::Output::new(p.PIN_12, Level::Low),
     ]);
+
+    let mut button_pin = BUTTON_PIN.lock().await;
+    *button_pin = Some(gpio::Input::new(p.PIN_13, gpio::Pull::Down));
+
+    let mut led0_pin = LED0_PIN.lock().await;
+    *led0_pin = Some(gpio::Output::new(p.PIN_0, Level::Low));
 }
 
 // cmk must use Option<DigitArray> instead of DigitArray?
@@ -172,33 +197,29 @@ async fn initialize_peripherals(p: embassy_rp::Peripherals) {
 async fn main(spawner: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
 
-    let p: embassy_rp::Peripherals = embassy_rp::init(Default::default());
-    initialize_peripherals(p).await;
-
+    init_static_peripherals().await;
     VIRTUAL_DISPLAY.init().await;
 
-    let compiled_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] =
-        [circles_wide(), hello_world_wide()];
+    let movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] = [circles_wide(), hello_world_wide()];
 
     // cmk Can't access this pin because don't have access to Peripherals, here
     // let _led_pin = gpio::Output::new(p.PIN_0, Level::Low);
 
     unwrap!(spawner.spawn(multiplex_display()));
+    unwrap!(spawner.spawn(track_button()));
 
-    let mut movie_index = 0;
-    loop {
-        let movie = &compiled_movies[movie_index];
-        movie_index = (movie_index + 1) % compiled_movies.len();
-
+    // loop through the movies, forever
+    for movie in movies.iter().cycle() {
+        // Loop through the frames of the current movie
         for range_values in movie.range_values() {
-            // Get the next frame of the animation (and its duration)
+            // Get the next frame of the movie (and its duration)
             let (start, end) = range_values.range.into_inner();
             let frame = *range_values.value;
 
-            // Display this frame
+            // Display the frame
             VIRTUAL_DISPLAY.set_all_digits(frame).await;
 
-            // Show this frame for the correct duration
+            // Show the frame for the correct duration
             let frame_count = (end + 1 - start) as u64;
             let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
             Timer::after(duration).await;

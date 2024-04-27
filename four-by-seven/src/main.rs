@@ -200,13 +200,13 @@ async fn main(spawner: Spawner) {
     init_static_peripherals().await;
     VIRTUAL_DISPLAY.init().await;
 
+    unwrap!(spawner.spawn(multiplex_display()));
+    unwrap!(spawner.spawn(track_button()));
+
     let movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] = [circles_wide(), hello_world_wide()];
 
     // cmk Can't access this pin because don't have access to Peripherals, here
     // let _led_pin = gpio::Output::new(p.PIN_0, Level::Low);
-
-    unwrap!(spawner.spawn(multiplex_display()));
-    unwrap!(spawner.spawn(track_button()));
 
     // loop through the movies, forever
     for movie in movies.iter().cycle() {

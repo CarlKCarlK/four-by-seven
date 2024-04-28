@@ -8,13 +8,16 @@ static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 const HEAP_SIZE: usize = 1024 * 64; // in bytes
 
 use core::array;
+use core::cmp::max;
 
+use alloc::format;
 use alloc_cortex_m::CortexMHeap;
 use defmt::unwrap;
 use embassy_executor::{Executor, Spawner};
 use embassy_futures::select::{select, Either};
+use embassy_rp::adc::{Adc, Async, Channel, Config, InterruptHandler};
 use embassy_rp::{
-    gpio,
+    bind_interrupts, gpio,
     multicore::{spawn_core1, Stack},
     peripherals::CORE1,
 };
@@ -30,6 +33,12 @@ use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to y
 pub struct VirtualDisplay<const DIGIT_COUNT: usize> {
     mutex_digits: Mutex<CriticalSectionRawMutex, [u8; DIGIT_COUNT]>,
 }
+
+const SLEEP: u64 = 2; // ms
+
+bind_interrupts!(struct Irqs {
+    ADC_IRQ_FIFO => InterruptHandler;
+});
 
 impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
     async fn write_text(&'static self, text: &str) {
@@ -64,7 +73,7 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
 
                 // Activate, pause, and deactivate the digit
                 digit_pins[digit_index].set_low(); // Assuming common cathode setup
-                Timer::after(Duration::from_millis(5)).await;
+                Timer::after(Duration::from_millis(SLEEP)).await;
                 digit_pins[digit_index].set_high();
             }
         }
@@ -108,6 +117,8 @@ struct Pins {
     segments1: &'static mut [gpio::Output<'static>; 8],
     button: &'static mut gpio::Input<'static>,
     led0: &'static mut gpio::Output<'static>,
+    adc: &'static mut Adc<'static, Async>,
+    adc_pin: &'static mut Channel<'static>,
 }
 
 impl Pins {
@@ -141,12 +152,19 @@ impl Pins {
         static LED0_PIN: StaticCell<gpio::Output> = StaticCell::new();
         let led0 = LED0_PIN.init(gpio::Output::new(p.PIN_0, Level::Low));
 
+        static ADC: StaticCell<Adc<Async>> = StaticCell::new();
+        let adc = ADC.init(Adc::new(p.ADC, Irqs, Config::default()));
+        static ADC_PIN: StaticCell<Channel> = StaticCell::new();
+        let adc_pin = ADC_PIN.init(Channel::new_pin(p.PIN_26, gpio::Pull::None));
+
         (
             Self {
                 digits1,
                 segments1,
                 button,
                 led0,
+                adc,
+                adc_pin,
             },
             core1,
         )
@@ -156,6 +174,22 @@ impl Pins {
 static mut CORE1_STACK: Stack<4096> = Stack::new();
 static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 
+fn scale_adc_value(adc_value: u16) -> u64 {
+    let old_min: u16 = 15;
+    let old_max: u16 = 4076;
+    let new_min: u64 = 1;
+    let new_max: u64 = 100;
+
+    // Use saturating_sub to prevent underflow
+    let safe_adc_value = adc_value.saturating_sub(old_min);
+
+    // Casts are necessary to ensure proper division and multiplication
+    let scaled_value =
+        (safe_adc_value as u64 * (new_max - new_min)) / (old_max as u64 - old_min as u64) + new_min;
+
+    // Ensure the value never goes below 1 (though it should not by calculation)
+    max(scaled_value, new_min)
+}
 #[embassy_executor::main]
 async fn main(_spawner0: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
@@ -177,6 +211,14 @@ async fn main(_spawner0: Spawner) {
 
     // Display "RUST" on the 4-digit 7-segment display while we render the movies
     VIRTUAL_DISPLAY1.write_text("RUST").await;
+
+    loop {
+        let level = pins.adc.read(pins.adc_pin).await.unwrap();
+        let scale = scale_adc_value(level);
+        let s = format!("{:04}", scale);
+        VIRTUAL_DISPLAY1.write_text(&s).await;
+        Timer::after(Duration::from_millis(SLEEP)).await;
+    }
 
     // Render the movies -- this is CPU intensive and will run on core0
     let render_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
@@ -206,7 +248,7 @@ async fn main(_spawner0: Spawner) {
 
             // The button was pressed, so wait for it to be released
             pins.led0.set_high(); // mirror button press on led0
-            Timer::after(Duration::from_millis(5)).await; // debounce button
+            Timer::after(Duration::from_millis(SLEEP)).await; // debounce button
             pins.button.wait_for_falling_edge().await;
             pins.led0.set_low();
         }

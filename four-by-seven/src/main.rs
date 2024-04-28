@@ -106,7 +106,7 @@ struct Pins {
     led0: &'static mut gpio::Output<'static>,
 }
 
-impl Default for Pins {
+impl Pins {
     fn default() -> Self {
         let p = embassy_rp::init(Default::default());
 
@@ -154,6 +154,8 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(multiplex_display1(pins.digits1, pins.segments1)));
 
     VIRTUAL_DISPLAY1.write_text("RUST").await;
+    Timer::after(Duration::from_millis(1000)).await;
+
     let compiled_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
         [circles_wide(), hello_world_wide()];
 

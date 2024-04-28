@@ -11,10 +11,14 @@ use core::array;
 
 use alloc_cortex_m::CortexMHeap;
 use defmt::unwrap;
-use embassy_executor::Spawner;
+use embassy_executor::{Executor, Spawner};
 use embassy_futures::select::{select, Either};
-use embassy_rp::gpio;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_rp::{
+    gpio,
+    multicore::{spawn_core1, Stack},
+    peripherals::CORE1,
+};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_hal_1::digital::OutputPin;
@@ -24,7 +28,7 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to your setup
 
 pub struct VirtualDisplay<const DIGIT_COUNT: usize> {
-    mutex_digits: Mutex<ThreadModeRawMutex, [u8; DIGIT_COUNT]>,
+    mutex_digits: Mutex<CriticalSectionRawMutex, [u8; DIGIT_COUNT]>,
 }
 
 impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
@@ -107,8 +111,9 @@ struct Pins {
 }
 
 impl Pins {
-    fn default() -> Self {
-        let p = embassy_rp::init(Default::default());
+    fn new() -> (Self, CORE1) {
+        let p: embassy_rp::Peripherals = embassy_rp::init(Default::default());
+        let core1 = p.CORE1;
 
         static DIGIT_PINS1: StaticCell<[gpio::Output; DIGIT_COUNT1]> = StaticCell::new();
         let digits1 = DIGIT_PINS1.init([
@@ -136,28 +141,44 @@ impl Pins {
         static LED0_PIN: StaticCell<gpio::Output> = StaticCell::new();
         let led0 = LED0_PIN.init(gpio::Output::new(p.PIN_0, Level::Low));
 
-        Self {
-            digits1,
-            segments1,
-            button,
-            led0,
-        }
+        (
+            Self {
+                digits1,
+                segments1,
+                button,
+                led0,
+            },
+            core1,
+        )
     }
 }
 
+static mut CORE1_STACK: Stack<4096> = Stack::new();
+static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
+
 #[embassy_executor::main]
-async fn main(spawner: Spawner) {
+async fn main(_spawner0: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
 
-    let pins = Pins::default();
+    let (pins, core1) = Pins::new();
 
-    unwrap!(spawner.spawn(multiplex_display1(pins.digits1, pins.segments1)));
+    spawn_core1(
+        core1,
+        unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
+        move || {
+            let executor1 = EXECUTOR1.init(Executor::new());
+            executor1.run(|spawner1| {
+                unwrap!(spawner1.spawn(multiplex_display1(pins.digits1, pins.segments1)))
+            });
+        },
+    );
+
+    // unwrap!(_spawner0.spawn(multiplex_display1(pins.digits1, pins.segments1)));
 
     VIRTUAL_DISPLAY1.write_text("RUST").await;
-    Timer::after(Duration::from_millis(1000)).await;
 
     let compiled_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
-        [circles_wide(), hello_world_wide()];
+        [hello_world_wide(), circles_wide()];
 
     // loop through the movies, forever
     for movie in compiled_movies.iter().cycle() {

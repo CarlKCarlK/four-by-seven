@@ -15,10 +15,7 @@ use core::{
 use alloc_cortex_m::CortexMHeap;
 use defmt::unwrap;
 use embassy_executor::Spawner;
-use embassy_futures::{
-    join::join,
-    select::{select, Either},
-};
+use embassy_futures::select::{select, Either};
 use embassy_rp::gpio;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -26,6 +23,7 @@ use embassy_time::{Duration, Timer};
 use embedded_hal_1::digital::OutputPin;
 use gpio::Level;
 use range_set_blaze::{RangeMapBlaze, RangeSetBlaze};
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to your setup
 
 pub const DIGIT_COUNT: usize = 4;
@@ -120,13 +118,10 @@ impl DigitArray {
 
 #[embassy_executor::task]
 #[allow(clippy::needless_range_loop)]
-async fn multiplex_display() {
-    // hold these forever
-    let mut digit_pins = DIGIT_PINS.lock().await;
-    let digit_pins = digit_pins.as_mut().unwrap();
-    let mut segment_pins = SEGMENT_PINS.lock().await;
-    let segment_pins = segment_pins.as_mut().unwrap();
-
+async fn multiplex_display(
+    digit_pins: &'static mut [gpio::Output<'_>; 4],
+    segment_pins: &'static mut [gpio::Output<'_>; 8],
+) {
     loop {
         for digit_index in 0..DIGIT_COUNT {
             VIRTUAL_DISPLAY
@@ -144,35 +139,22 @@ async fn multiplex_display() {
     }
 }
 
-#[embassy_executor::task]
-#[allow(clippy::needless_range_loop)]
-async fn turn_on_led0() {
-    let mut led0_pin = LED0_PIN.lock().await;
-    let led0_pin = led0_pin.as_mut().unwrap();
-    led0_pin.set_high();
-    Timer::after(Duration::from_millis(100)).await; // debounce
-    led0_pin.set_low();
-}
-
-// cmk use static_cell for these? See https://github.com/embassy-rs/embassy/blob/main/examples/rp/src/bin/multicore.rs
-static DIGIT_PINS: Mutex<ThreadModeRawMutex, Option<[gpio::Output; 4]>> = Mutex::new(None);
-static SEGMENT_PINS: Mutex<ThreadModeRawMutex, Option<[gpio::Output; 8]>> = Mutex::new(None);
-static BUTTON_PIN: Mutex<ThreadModeRawMutex, Option<gpio::Input>> = Mutex::new(None);
-static LED0_PIN: Mutex<ThreadModeRawMutex, Option<gpio::Output>> = Mutex::new(None);
-
-async fn init_static_peripherals() {
+fn init_pins() -> (
+    &'static mut [gpio::Output<'static>; 4],
+    &'static mut [gpio::Output<'static>; 8],
+    &'static mut gpio::Input<'static>,
+    &'static mut gpio::Output<'static>,
+) {
     let p: embassy_rp::Peripherals = embassy_rp::init(Default::default());
-
-    let mut digit_pins = DIGIT_PINS.lock().await;
-    *digit_pins = Some([
+    static DIGIT_PINS: StaticCell<[gpio::Output; 4]> = StaticCell::new();
+    let digit_pins = DIGIT_PINS.init([
         gpio::Output::new(p.PIN_1, Level::High),
         gpio::Output::new(p.PIN_2, Level::High),
         gpio::Output::new(p.PIN_3, Level::High),
         gpio::Output::new(p.PIN_4, Level::High),
     ]);
-
-    let mut segment_pins = SEGMENT_PINS.lock().await;
-    *segment_pins = Some([
+    static SEGMENT_PINS: StaticCell<[gpio::Output; 8]> = StaticCell::new();
+    let segment_pins = SEGMENT_PINS.init([
         gpio::Output::new(p.PIN_5, Level::Low),
         gpio::Output::new(p.PIN_6, Level::Low),
         gpio::Output::new(p.PIN_7, Level::Low),
@@ -182,32 +164,29 @@ async fn init_static_peripherals() {
         gpio::Output::new(p.PIN_11, Level::Low),
         gpio::Output::new(p.PIN_12, Level::Low),
     ]);
-
-    let mut button_pin = BUTTON_PIN.lock().await;
-    *button_pin = Some(gpio::Input::new(p.PIN_13, gpio::Pull::Down));
-
-    let mut led0_pin = LED0_PIN.lock().await;
-    *led0_pin = Some(gpio::Output::new(p.PIN_0, Level::Low));
+    static BUTTON_PIN: StaticCell<gpio::Input> = StaticCell::new();
+    let button_pin = BUTTON_PIN.init(gpio::Input::new(p.PIN_13, gpio::Pull::Down));
+    static LED0_PIN: StaticCell<gpio::Output> = StaticCell::new();
+    let led0_pin = LED0_PIN.init(gpio::Output::new(p.PIN_0, Level::Low));
+    let result: (
+        &mut [gpio::Output; 4],
+        &mut [gpio::Output; 8],
+        &mut gpio::Input,
+        &mut gpio::Output,
+    ) = (digit_pins, segment_pins, button_pin, led0_pin);
+    result
 }
-
-// cmk must use Option<DigitArray> instead of DigitArray?
-// Can we have Peripherals define elsewhere so we use the other led and the button
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
+    let (digit_pins, segment_pins, button_pin, led0_pin) = init_pins();
 
-    join(init_static_peripherals(), VIRTUAL_DISPLAY.init()).await;
+    VIRTUAL_DISPLAY.init().await;
 
-    unwrap!(spawner.spawn(multiplex_display()));
+    unwrap!(spawner.spawn(multiplex_display(digit_pins, segment_pins)));
 
     let movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] = [circles_wide(), hello_world_wide()];
-
-    // hold this forever
-    let mut button_pin = BUTTON_PIN.lock().await;
-    let button_pin = button_pin.as_mut().unwrap();
-    let mut led0_pin = LED0_PIN.lock().await;
-    let led0_pin = led0_pin.as_mut().unwrap();
 
     // loop through the movies, forever
     for movie in movies.iter().cycle() {

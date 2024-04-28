@@ -7,10 +7,7 @@ extern crate alloc;
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 const HEAP_SIZE: usize = 1024 * 64; // in bytes
 
-use core::{
-    array,
-    ops::{Index, IndexMut},
-};
+use core::array;
 
 use alloc_cortex_m::CortexMHeap;
 use defmt::unwrap;
@@ -29,84 +26,21 @@ use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to y
 pub const DIGIT_COUNT: usize = 4;
 
 pub struct VirtualDisplay {
-    mutex_digits: Mutex<ThreadModeRawMutex, Option<DigitArray>>,
+    mutex_digits: Mutex<ThreadModeRawMutex, [u8; DIGIT_COUNT]>,
 }
 
-static VIRTUAL_DISPLAY: VirtualDisplay = VirtualDisplay {
-    mutex_digits: Mutex::new(None),
+static VIRTUAL_DISPLAY1: VirtualDisplay = VirtualDisplay {
+    mutex_digits: Mutex::new([255; DIGIT_COUNT]),
 };
 
 impl VirtualDisplay {
-    async fn init(&'static self) {
-        let mut mutex_digits = VIRTUAL_DISPLAY.mutex_digits.lock().await;
-        *mutex_digits = Some(DigitArray::default());
-    }
-
     async fn bool_iter(&'static self, digit_index: usize) -> array::IntoIter<bool, 8> {
         // inner scope to release the lock
-        // cmk other versions of MUTEX use a closure
-        let digit_array = self.mutex_digits.lock().await;
-        let digit_array = digit_array.as_ref().unwrap();
-        digit_array.bool_iter(digit_index)
-    }
-
-    async fn set_all_digits(&'static self, all: [u8; DIGIT_COUNT]) {
-        let mut digit_array = VIRTUAL_DISPLAY.mutex_digits.lock().await;
-        let digit_array = digit_array.as_mut().unwrap();
-        digit_array.set_all_digits(&all);
-    }
-}
-
-pub struct DigitArray {
-    digits: [u8; DIGIT_COUNT],
-}
-
-// default is 255 x DIGIT_COUNT
-impl Default for DigitArray {
-    fn default() -> Self {
-        DigitArray {
-            digits: [255; DIGIT_COUNT],
+        let mut value: u8;
+        {
+            let digit_array = self.mutex_digits.lock().await;
+            value = digit_array[digit_index];
         }
-    }
-}
-
-impl Index<usize> for DigitArray {
-    type Output = u8;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.digits[index]
-    }
-}
-
-impl IndexMut<usize> for DigitArray {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.digits[index]
-    }
-}
-
-impl DigitArray {
-    pub fn set_segment(&mut self, digit: usize, segment: usize, state: bool) {
-        assert!(segment < 8, "segment out of range");
-        if state {
-            self[digit] |= 1 << segment;
-        } else {
-            self[digit] &= !(1 << segment);
-        }
-    }
-
-    pub fn segment(&self, digit: usize, segment: usize) -> bool {
-        assert!(segment < 8, "segment out of range");
-        (self[digit] >> segment) & 1 == 1
-    }
-
-    pub fn set_all_digits(&mut self, &all: &[u8; DIGIT_COUNT]) {
-        for (digit_index, value) in all.iter().enumerate() {
-            self[digit_index] = *value;
-        }
-    }
-
-    pub fn bool_iter(&self, digit: usize) -> array::IntoIter<bool, 8> {
-        let mut value: u8 = self[digit];
         let mut arr = [false; 8];
         for item in arr.iter_mut() {
             *item = value & 1 == 1;
@@ -114,28 +48,45 @@ impl DigitArray {
         }
         arr.into_iter()
     }
-}
 
-#[embassy_executor::task]
-#[allow(clippy::needless_range_loop)]
-async fn multiplex_display(
-    digit_pins: &'static mut [gpio::Output<'_>; 4],
-    segment_pins: &'static mut [gpio::Output<'_>; 8],
-) {
-    loop {
-        for digit_index in 0..DIGIT_COUNT {
-            VIRTUAL_DISPLAY
-                .bool_iter(digit_index)
-                .await
-                .zip(segment_pins.iter_mut())
-                .for_each(|(state, segment_pin)| {
-                    segment_pin.set_state(state.into()).unwrap();
-                });
-            // Activate and deactivate the digit
-            digit_pins[digit_index].set_low(); // Assuming common cathode setup
-            Timer::after(Duration::from_millis(5)).await;
-            digit_pins[digit_index].set_high();
+    async fn set_all_digits(&'static self, all: [u8; DIGIT_COUNT]) {
+        let mut digit_array = self.mutex_digits.lock().await;
+        for (digit, value) in digit_array.iter_mut().zip(all.iter().cloned()) {
+            *digit = value;
         }
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn spawn_multiplexing(
+        &'static self,
+        spawner: &Spawner,
+        digit_pins: &'static mut [gpio::Output<'_>; 4],
+        segment_pins: &'static mut [gpio::Output<'_>; 8],
+    ) {
+        #[embassy_executor::task]
+        async fn multiplex_display(
+            virtual_display: &'static VirtualDisplay,
+            digit_pins: &'static mut [gpio::Output<'_>; 4],
+            segment_pins: &'static mut [gpio::Output<'_>; 8],
+        ) {
+            loop {
+                for digit_index in 0..DIGIT_COUNT {
+                    virtual_display
+                        .bool_iter(digit_index)
+                        .await
+                        .zip(segment_pins.iter_mut())
+                        .for_each(|(state, segment_pin)| {
+                            segment_pin.set_state(state.into()).unwrap();
+                        });
+                    // Activate and deactivate the digit
+                    digit_pins[digit_index].set_low(); // Assuming common cathode setup
+                    Timer::after(Duration::from_millis(5)).await;
+                    digit_pins[digit_index].set_high();
+                }
+            }
+        }
+
+        unwrap!(spawner.spawn(multiplex_display(self, digit_pins, segment_pins)));
     }
 }
 
@@ -188,11 +139,10 @@ impl Default for Pins {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
+
     let pins = Pins::default();
 
-    VIRTUAL_DISPLAY.init().await;
-
-    unwrap!(spawner.spawn(multiplex_display(pins.digits, pins.segments)));
+    VIRTUAL_DISPLAY1.spawn_multiplexing(&spawner, pins.digits, pins.segments);
 
     let movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] = [circles_wide(), hello_world_wide()];
 
@@ -205,7 +155,7 @@ async fn main(spawner: Spawner) {
             let frame = *range_values.value;
 
             // Display the frame
-            VIRTUAL_DISPLAY.set_all_digits(frame).await;
+            VIRTUAL_DISPLAY1.set_all_digits(frame).await;
 
             // Show the frame for the correct duration
             let frame_count = (end + 1 - start) as u64;

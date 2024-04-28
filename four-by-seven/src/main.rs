@@ -23,76 +23,85 @@ use range_set_blaze::{RangeMapBlaze, RangeSetBlaze};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to your setup
 
-pub const DIGIT_COUNT: usize = 4;
-
-pub struct VirtualDisplay {
+pub struct VirtualDisplay<const DIGIT_COUNT: usize> {
     mutex_digits: Mutex<ThreadModeRawMutex, [u8; DIGIT_COUNT]>,
 }
 
-static VIRTUAL_DISPLAY1: VirtualDisplay = VirtualDisplay {
-    mutex_digits: Mutex::new([255; DIGIT_COUNT]),
-};
-
-impl VirtualDisplay {
-    async fn bool_iter(&'static self, digit_index: usize) -> array::IntoIter<bool, 8> {
-        // inner scope to release the lock
-        let mut value: u8;
-        {
-            let digit_array = self.mutex_digits.lock().await;
-            value = digit_array[digit_index];
-        }
-        let mut arr = [false; 8];
-        for item in arr.iter_mut() {
-            *item = value & 1 == 1;
-            value >>= 1;
-        }
-        arr.into_iter()
+impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
+    async fn write_text(&'static self, text: &str) {
+        let bytes = line_to_u8_array(text);
+        self.write_bytes(bytes).await;
     }
-
-    async fn set_all_digits(&'static self, all: [u8; DIGIT_COUNT]) {
-        let mut digit_array = self.mutex_digits.lock().await;
-        for (digit, value) in digit_array.iter_mut().zip(all.iter().cloned()) {
-            *digit = value;
+    async fn write_bytes(&'static self, bytes_in: [u8; DIGIT_COUNT]) {
+        let mut bytes_out = self.mutex_digits.lock().await;
+        for (byte_out, byte_in) in bytes_out.iter_mut().zip(bytes_in.iter()) {
+            *byte_out = *byte_in;
         }
     }
 
     #[allow(clippy::needless_range_loop)]
-    fn spawn_multiplexing(
+    async fn multiplex(
         &'static self,
-        spawner: &Spawner,
-        digit_pins: &'static mut [gpio::Output<'_>; 4],
+        digit_pins: &'static mut [gpio::Output<'_>; DIGIT_COUNT],
         segment_pins: &'static mut [gpio::Output<'_>; 8],
     ) {
-        #[embassy_executor::task]
-        async fn multiplex_display(
-            virtual_display: &'static VirtualDisplay,
-            digit_pins: &'static mut [gpio::Output<'_>; 4],
-            segment_pins: &'static mut [gpio::Output<'_>; 8],
-        ) {
-            loop {
-                for digit_index in 0..DIGIT_COUNT {
-                    virtual_display
-                        .bool_iter(digit_index)
-                        .await
-                        .zip(segment_pins.iter_mut())
-                        .for_each(|(state, segment_pin)| {
-                            segment_pin.set_state(state.into()).unwrap();
-                        });
-                    // Activate and deactivate the digit
-                    digit_pins[digit_index].set_low(); // Assuming common cathode setup
-                    Timer::after(Duration::from_millis(5)).await;
-                    digit_pins[digit_index].set_high();
-                }
+        loop {
+            for digit_index in 0..DIGIT_COUNT {
+                // For this digit, get the segments to display as a bool iterator.
+                // This is async because we may need to wait for the display's availability.
+                let bool_iter = self.bool_iter(digit_index).await;
+
+                // Set the segment pins with the bool iterator
+                bool_iter
+                    .zip(segment_pins.iter_mut())
+                    .for_each(|(state, segment_pin)| {
+                        segment_pin.set_state(state.into()).unwrap();
+                    });
+
+                // Activate, pause, and deactivate the digit
+                digit_pins[digit_index].set_low(); // Assuming common cathode setup
+                Timer::after(Duration::from_millis(5)).await;
+                digit_pins[digit_index].set_high();
             }
         }
+    }
 
-        unwrap!(spawner.spawn(multiplex_display(self, digit_pins, segment_pins)));
+    async fn bool_iter(&'static self, digit_index: usize) -> array::IntoIter<bool, 8> {
+        // inner scope to release the lock
+        let mut byte: u8;
+        {
+            let digit_array = self.mutex_digits.lock().await;
+            byte = digit_array[digit_index];
+        }
+
+        // turn a u8 into an iterator of bool
+        let mut bools_out = [false; 8];
+        for bool_out in bools_out.iter_mut() {
+            *bool_out = byte & 1 == 1;
+            byte >>= 1;
+        }
+        bools_out.into_iter()
     }
 }
 
+// Display #1 is a 4-digit 7-segment display
+pub const DIGIT_COUNT1: usize = 4;
+
+static VIRTUAL_DISPLAY1: VirtualDisplay<DIGIT_COUNT1> = VirtualDisplay {
+    mutex_digits: Mutex::new([255; DIGIT_COUNT1]),
+};
+
+#[embassy_executor::task]
+async fn multiplex_display1(
+    digit_pins: &'static mut [gpio::Output<'_>; DIGIT_COUNT1],
+    segment_pins: &'static mut [gpio::Output<'_>; 8],
+) {
+    VIRTUAL_DISPLAY1.multiplex(digit_pins, segment_pins).await;
+}
+
 struct Pins {
-    digits: &'static mut [gpio::Output<'static>; 4],
-    segments: &'static mut [gpio::Output<'static>; 8],
+    digits1: &'static mut [gpio::Output<'static>; DIGIT_COUNT1],
+    segments1: &'static mut [gpio::Output<'static>; 8],
     button: &'static mut gpio::Input<'static>,
     led0: &'static mut gpio::Output<'static>,
 }
@@ -101,16 +110,16 @@ impl Default for Pins {
     fn default() -> Self {
         let p = embassy_rp::init(Default::default());
 
-        static DIGIT_PINS: StaticCell<[gpio::Output; 4]> = StaticCell::new();
-        let digits = DIGIT_PINS.init([
+        static DIGIT_PINS1: StaticCell<[gpio::Output; DIGIT_COUNT1]> = StaticCell::new();
+        let digits1 = DIGIT_PINS1.init([
             gpio::Output::new(p.PIN_1, Level::High),
             gpio::Output::new(p.PIN_2, Level::High),
             gpio::Output::new(p.PIN_3, Level::High),
             gpio::Output::new(p.PIN_4, Level::High),
         ]);
 
-        static SEGMENT_PINS: StaticCell<[gpio::Output; 8]> = StaticCell::new();
-        let segments = SEGMENT_PINS.init([
+        static SEGMENT_PINS1: StaticCell<[gpio::Output; 8]> = StaticCell::new();
+        let segments1 = SEGMENT_PINS1.init([
             gpio::Output::new(p.PIN_5, Level::Low),
             gpio::Output::new(p.PIN_6, Level::Low),
             gpio::Output::new(p.PIN_7, Level::Low),
@@ -128,8 +137,8 @@ impl Default for Pins {
         let led0 = LED0_PIN.init(gpio::Output::new(p.PIN_0, Level::Low));
 
         Self {
-            digits,
-            segments,
+            digits1,
+            segments1,
             button,
             led0,
         }
@@ -142,12 +151,14 @@ async fn main(spawner: Spawner) {
 
     let pins = Pins::default();
 
-    VIRTUAL_DISPLAY1.spawn_multiplexing(&spawner, pins.digits, pins.segments);
+    unwrap!(spawner.spawn(multiplex_display1(pins.digits1, pins.segments1)));
 
-    let movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] = [circles_wide(), hello_world_wide()];
+    VIRTUAL_DISPLAY1.write_text("RUST").await;
+    let compiled_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
+        [circles_wide(), hello_world_wide()];
 
     // loop through the movies, forever
-    for movie in movies.iter().cycle() {
+    for movie in compiled_movies.iter().cycle() {
         // Loop through the frames of the current movie
         for range_values in movie.range_values() {
             // Get the next frame of the movie (and its duration)
@@ -155,7 +166,7 @@ async fn main(spawner: Spawner) {
             let frame = *range_values.value;
 
             // Display the frame
-            VIRTUAL_DISPLAY1.set_all_digits(frame).await;
+            VIRTUAL_DISPLAY1.write_bytes(frame).await;
 
             // Show the frame for the correct duration
             let frame_count = (end + 1 - start) as u64;
@@ -180,7 +191,7 @@ async fn main(spawner: Spawner) {
 
 const FPS: i32 = 24;
 
-fn line_to_u8_array(line: &str) -> [u8; DIGIT_COUNT] {
+fn line_to_u8_array<const DIGIT_COUNT: usize>(line: &str) -> [u8; DIGIT_COUNT] {
     let mut result = [0; DIGIT_COUNT];
     for (i, c) in line.chars().enumerate() {
         // cmk could try to go out of the array
@@ -189,8 +200,9 @@ fn line_to_u8_array(line: &str) -> [u8; DIGIT_COUNT] {
     result
 }
 
-pub fn hello_world_wide() -> RangeMapBlaze<i32, [u8; DIGIT_COUNT]> {
-    let message = "3\n 2\n  1\n\n   H\n  He\n Hel\nHell\nello\nllo\nlo W\no Wo\n Wor\nWorl\norld\nrld\nld\nd\n";
+pub fn hello_world_wide() -> RangeMapBlaze<i32, [u8; DIGIT_COUNT1]> {
+    let message =
+        "3\n 2\n  1\n\n   H\n  He\n Hel\nHell\nello\nllo\nlo R\no Ru\n Rus\nRust\nust\nst\nt\n";
     let message: RangeMapBlaze<i32, _> = message
         .lines()
         .enumerate()
@@ -231,7 +243,7 @@ pub fn hello_world() -> RangeMapBlaze<i32, u8> {
     message
 }
 
-pub fn circles_wide() -> RangeMapBlaze<i32, [u8; DIGIT_COUNT]> {
+pub fn circles_wide() -> RangeMapBlaze<i32, [u8; DIGIT_COUNT1]> {
     // Light up segments A to F
     let circle = RangeMapBlaze::from_iter([
         (0, [0, 0, 0, Leds::SEG_A]),
@@ -497,7 +509,7 @@ pub fn linear(
         .collect()
 }
 
-pub fn linear_wide(
+pub fn linear_wide<const DIGIT_COUNT: usize>(
     range_map_blaze: &RangeMapBlaze<i32, [u8; DIGIT_COUNT]>,
     scale: i32,
     shift: i32,

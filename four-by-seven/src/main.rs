@@ -162,6 +162,7 @@ async fn main(_spawner0: Spawner) {
 
     let (pins, core1) = Pins::new();
 
+    // Spawn 'multiplex_display1' on core1
     spawn_core1(
         core1,
         unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
@@ -172,16 +173,17 @@ async fn main(_spawner0: Spawner) {
             });
         },
     );
-
     // unwrap!(_spawner0.spawn(multiplex_display1(pins.digits1, pins.segments1)));
 
+    // Display "RUST" on the 4-digit 7-segment display while we render the movies
     VIRTUAL_DISPLAY1.write_text("RUST").await;
 
-    let compiled_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
+    // Render the movies -- this is CPU intensive and will run on core0
+    let render_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
         [hello_world_wide(), circles_wide()];
 
     // loop through the movies, forever
-    for movie in compiled_movies.iter().cycle() {
+    for movie in render_movies.iter().cycle() {
         // Loop through the frames of the current movie
         for range_values in movie.range_values() {
             // Get the next frame of the movie (and its duration)
@@ -191,7 +193,7 @@ async fn main(_spawner0: Spawner) {
             // Display the frame
             VIRTUAL_DISPLAY1.write_bytes(frame).await;
 
-            // Show the frame for the correct duration
+            // Find the duration that this frame should be displayed
             let frame_count = (end + 1 - start) as u64;
             let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
 
@@ -199,12 +201,11 @@ async fn main(_spawner0: Spawner) {
             if let Either::First(()) =
                 select(Timer::after(duration), pins.button.wait_for_rising_edge()).await
             {
-                // timer finished
-                continue;
+                continue; // Frame finished, so go to the next frame
             }
 
-            // wait for button to be released
-            pins.led0.set_high();
+            // The button was pressed, so wait for it to be released
+            pins.led0.set_high(); // mirror button press on led0
             Timer::after(Duration::from_millis(5)).await; // debounce button
             pins.button.wait_for_falling_edge().await;
             pins.led0.set_low();

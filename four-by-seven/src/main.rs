@@ -15,7 +15,10 @@ use core::{
 use alloc_cortex_m::CortexMHeap;
 use defmt::unwrap;
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
+use embassy_futures::{
+    join::join,
+    select::{select, Either},
+};
 use embassy_rp::gpio;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -143,18 +146,12 @@ async fn multiplex_display() {
 
 #[embassy_executor::task]
 #[allow(clippy::needless_range_loop)]
-async fn track_button() {
-    // hold these forever
-    let mut button_pin = BUTTON_PIN.lock().await;
-    let button_pin = button_pin.as_mut().unwrap();
+async fn turn_on_led0() {
     let mut led0_pin = LED0_PIN.lock().await;
     let led0_pin = led0_pin.as_mut().unwrap();
-
-    loop {
-        button_pin.wait_for_any_edge().await;
-        led0_pin.set_state(button_pin.is_high().into()).unwrap();
-        Timer::after(Duration::from_millis(5)).await;
-    }
+    led0_pin.set_high();
+    Timer::after(Duration::from_millis(100)).await; // debounce
+    led0_pin.set_low();
 }
 
 // cmk use static_cell for these? See https://github.com/embassy-rs/embassy/blob/main/examples/rp/src/bin/multicore.rs
@@ -203,12 +200,14 @@ async fn main(spawner: Spawner) {
     join(init_static_peripherals(), VIRTUAL_DISPLAY.init()).await;
 
     unwrap!(spawner.spawn(multiplex_display()));
-    unwrap!(spawner.spawn(track_button()));
 
     let movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] = [circles_wide(), hello_world_wide()];
 
-    // cmk Can't access this pin because don't have access to Peripherals, here
-    // let _led_pin = gpio::Output::new(p.PIN_0, Level::Low);
+    // hold this forever
+    let mut button_pin = BUTTON_PIN.lock().await;
+    let button_pin = button_pin.as_mut().unwrap();
+    let mut led0_pin = LED0_PIN.lock().await;
+    let led0_pin = led0_pin.as_mut().unwrap();
 
     // loop through the movies, forever
     for movie in movies.iter().cycle() {
@@ -224,7 +223,20 @@ async fn main(spawner: Spawner) {
             // Show the frame for the correct duration
             let frame_count = (end + 1 - start) as u64;
             let duration = Duration::from_millis(frame_count * 1000 / FPS as u64);
-            Timer::after(duration).await;
+
+            // Wait for the frame to finish or the button to be pressed
+            if let Either::First(()) =
+                select(Timer::after(duration), button_pin.wait_for_rising_edge()).await
+            {
+                // timer finished
+                continue;
+            }
+
+            // wait for button to be released
+            led0_pin.set_high();
+            Timer::after(Duration::from_millis(5)).await; // debounce button
+            button_pin.wait_for_falling_edge().await;
+            led0_pin.set_low();
         }
     }
 }

@@ -139,52 +139,60 @@ async fn multiplex_display(
     }
 }
 
-fn init_pins() -> (
-    &'static mut [gpio::Output<'static>; 4],
-    &'static mut [gpio::Output<'static>; 8],
-    &'static mut gpio::Input<'static>,
-    &'static mut gpio::Output<'static>,
-) {
-    let p: embassy_rp::Peripherals = embassy_rp::init(Default::default());
-    static DIGIT_PINS: StaticCell<[gpio::Output; 4]> = StaticCell::new();
-    let digit_pins = DIGIT_PINS.init([
-        gpio::Output::new(p.PIN_1, Level::High),
-        gpio::Output::new(p.PIN_2, Level::High),
-        gpio::Output::new(p.PIN_3, Level::High),
-        gpio::Output::new(p.PIN_4, Level::High),
-    ]);
-    static SEGMENT_PINS: StaticCell<[gpio::Output; 8]> = StaticCell::new();
-    let segment_pins = SEGMENT_PINS.init([
-        gpio::Output::new(p.PIN_5, Level::Low),
-        gpio::Output::new(p.PIN_6, Level::Low),
-        gpio::Output::new(p.PIN_7, Level::Low),
-        gpio::Output::new(p.PIN_8, Level::Low),
-        gpio::Output::new(p.PIN_9, Level::Low),
-        gpio::Output::new(p.PIN_10, Level::Low),
-        gpio::Output::new(p.PIN_11, Level::Low),
-        gpio::Output::new(p.PIN_12, Level::Low),
-    ]);
-    static BUTTON_PIN: StaticCell<gpio::Input> = StaticCell::new();
-    let button_pin = BUTTON_PIN.init(gpio::Input::new(p.PIN_13, gpio::Pull::Down));
-    static LED0_PIN: StaticCell<gpio::Output> = StaticCell::new();
-    let led0_pin = LED0_PIN.init(gpio::Output::new(p.PIN_0, Level::Low));
-    let result: (
-        &mut [gpio::Output; 4],
-        &mut [gpio::Output; 8],
-        &mut gpio::Input,
-        &mut gpio::Output,
-    ) = (digit_pins, segment_pins, button_pin, led0_pin);
-    result
+struct Pins {
+    digits: &'static mut [gpio::Output<'static>; 4],
+    segments: &'static mut [gpio::Output<'static>; 8],
+    button: &'static mut gpio::Input<'static>,
+    led0: &'static mut gpio::Output<'static>,
+}
+
+impl Default for Pins {
+    fn default() -> Self {
+        let p = embassy_rp::init(Default::default());
+
+        static DIGIT_PINS: StaticCell<[gpio::Output; 4]> = StaticCell::new();
+        let digits = DIGIT_PINS.init([
+            gpio::Output::new(p.PIN_1, Level::High),
+            gpio::Output::new(p.PIN_2, Level::High),
+            gpio::Output::new(p.PIN_3, Level::High),
+            gpio::Output::new(p.PIN_4, Level::High),
+        ]);
+
+        static SEGMENT_PINS: StaticCell<[gpio::Output; 8]> = StaticCell::new();
+        let segments = SEGMENT_PINS.init([
+            gpio::Output::new(p.PIN_5, Level::Low),
+            gpio::Output::new(p.PIN_6, Level::Low),
+            gpio::Output::new(p.PIN_7, Level::Low),
+            gpio::Output::new(p.PIN_8, Level::Low),
+            gpio::Output::new(p.PIN_9, Level::Low),
+            gpio::Output::new(p.PIN_10, Level::Low),
+            gpio::Output::new(p.PIN_11, Level::Low),
+            gpio::Output::new(p.PIN_12, Level::Low),
+        ]);
+
+        static BUTTON_PIN: StaticCell<gpio::Input> = StaticCell::new();
+        let button = BUTTON_PIN.init(gpio::Input::new(p.PIN_13, gpio::Pull::Down));
+
+        static LED0_PIN: StaticCell<gpio::Output> = StaticCell::new();
+        let led0 = LED0_PIN.init(gpio::Output::new(p.PIN_0, Level::Low));
+
+        Self {
+            digits,
+            segments,
+            button,
+            led0,
+        }
+    }
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
-    let (digit_pins, segment_pins, button_pin, led0_pin) = init_pins();
+    let pins = Pins::default();
 
     VIRTUAL_DISPLAY.init().await;
 
-    unwrap!(spawner.spawn(multiplex_display(digit_pins, segment_pins)));
+    unwrap!(spawner.spawn(multiplex_display(pins.digits, pins.segments)));
 
     let movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT]>; 2] = [circles_wide(), hello_world_wide()];
 
@@ -205,17 +213,17 @@ async fn main(spawner: Spawner) {
 
             // Wait for the frame to finish or the button to be pressed
             if let Either::First(()) =
-                select(Timer::after(duration), button_pin.wait_for_rising_edge()).await
+                select(Timer::after(duration), pins.button.wait_for_rising_edge()).await
             {
                 // timer finished
                 continue;
             }
 
             // wait for button to be released
-            led0_pin.set_high();
+            pins.led0.set_high();
             Timer::after(Duration::from_millis(5)).await; // debounce button
-            button_pin.wait_for_falling_edge().await;
-            led0_pin.set_low();
+            pins.button.wait_for_falling_edge().await;
+            pins.led0.set_low();
         }
     }
 }

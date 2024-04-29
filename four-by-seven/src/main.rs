@@ -9,6 +9,7 @@ const HEAP_SIZE: usize = 1024 * 64; // in bytes
 
 use core::array;
 use core::cmp::max;
+use embassy_futures::join::join;
 use heapless::{LinearMap, Vec};
 
 use alloc_cortex_m::CortexMHeap;
@@ -59,18 +60,20 @@ impl VirtualPotentiometer {
     }
 }
 
-static CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+// static CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 
 pub struct VirtualDisplay<const DIGIT_COUNT: usize> {
     mutex_digits: Mutex<CriticalSectionRawMutex, [u8; DIGIT_COUNT]>,
+    update_display_channel: Channel<CriticalSectionRawMutex, (), 1>,
 }
 
 impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
-    pub fn init() -> Self {
-        Self {
-            mutex_digits: Mutex::new([255; DIGIT_COUNT]),
-        }
-    }
+    // pub fn init() -> Self {
+    //     Self {
+    //         mutex_digits: Mutex::new([255; DIGIT_COUNT]),
+    //         channel: Channel::new(),
+    //     }
+    // }
     pub async fn write_text(&'static self, text: &str) {
         let bytes = line_to_u8_array(text);
         self.write_bytes(bytes).await;
@@ -83,7 +86,9 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
                 *byte_out = *byte_in;
             }
         }
-        let _ = CHANNEL.try_send(());
+        // Say that the display should be updated. If a previous update is
+        // still pending, this new update can be ignored.
+        let _ = self.update_display_channel.try_send(());
     }
 
     pub async fn write_number(&'static self, mut number: u16) {
@@ -139,7 +144,10 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
             // if 1, display it and wait 1 second
             // otherwise, multiplex them
             match map.len() {
-                0 => CHANNEL.receive().await,
+                // If the display should be empty, then just wait for the next update
+                0 => self.update_display_channel.receive().await,
+                // If only one pattern should be displayed (even on multiple digits), display it
+                // and wait for the next update
                 1 => {
                     // get one and only key and value
                     let (byte, indexes) = map.iter().next().unwrap();
@@ -153,11 +161,12 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
                     for digit_index in indexes.iter() {
                         digit_pins[*digit_index].set_low(); // Assuming common cathode setup
                     }
-                    CHANNEL.receive().await;
+                    self.update_display_channel.receive().await;
                     for digit_index in indexes.iter() {
                         digit_pins[*digit_index].set_high();
                     }
                 }
+                // If multiple patterns should be displayed, multiplex them until the next update
                 _ => {
                     loop {
                         for (byte, indexes) in map.iter() {
@@ -175,13 +184,18 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
                             // cmk when map.len is small, may want to wait longer
                             let mut sleep = scale_adc_value(VIRTUAL_POTENTIOMETER1.read().await);
                             sleep = sleep * DIGIT_COUNT as u64 / map.len() as u64;
-                            Timer::after(Duration::from_millis(sleep)).await;
+                            // Sleep (but wake up if the display should be updated)
+                            select(
+                                Timer::after(Duration::from_millis(sleep)),
+                                self.update_display_channel.receive(),
+                            )
+                            .await;
                             for digit_index in indexes.iter() {
                                 digit_pins[*digit_index].set_high();
                             }
                         }
                         // break out of loop if the mutex has changed
-                        if CHANNEL.try_receive().is_err() {
+                        if self.update_display_channel.try_receive().is_err() {
                             break;
                         }
                     }
@@ -217,6 +231,7 @@ pub const DIGIT_COUNT1: usize = 4;
 
 static VIRTUAL_DISPLAY1: VirtualDisplay<DIGIT_COUNT1> = VirtualDisplay {
     mutex_digits: Mutex::new([255; DIGIT_COUNT1]),
+    update_display_channel: Channel::new(),
 };
 
 #[embassy_executor::task]

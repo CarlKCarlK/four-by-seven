@@ -10,7 +10,6 @@ const HEAP_SIZE: usize = 1024 * 64; // in bytes
 use core::array;
 use core::cmp::max;
 
-use alloc::format;
 use alloc_cortex_m::CortexMHeap;
 use defmt::unwrap;
 use embassy_executor::{Executor, Spawner};
@@ -30,26 +29,69 @@ use range_set_blaze::{RangeMapBlaze, RangeSetBlaze};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to your setup
 
+bind_interrupts!(struct Irqs {
+    ADC_IRQ_FIFO => InterruptHandler;
+});
+pub struct VirtualPotentiometer {
+    mutex_level: Mutex<CriticalSectionRawMutex, u16>,
+}
+
+impl VirtualPotentiometer {
+    async fn read(&'static self) -> u16 {
+        let level = self.mutex_level.lock().await;
+        *level
+    }
+    async fn multiplex(
+        &'static self,
+        acd: &'static mut Adc<'static, Async>,
+        adc_pin: &'static mut Channel<'static>,
+    ) {
+        loop {
+            let level_in = acd.read(adc_pin).await;
+            if let Ok(level_in) = level_in {
+                let mut level_out = self.mutex_level.lock().await;
+                *level_out = level_in;
+            }
+            Timer::after(Duration::from_millis(100)).await;
+        }
+    }
+}
+
 pub struct VirtualDisplay<const DIGIT_COUNT: usize> {
     mutex_digits: Mutex<CriticalSectionRawMutex, [u8; DIGIT_COUNT]>,
 }
 
-const SLEEP: u64 = 2; // ms
-
-bind_interrupts!(struct Irqs {
-    ADC_IRQ_FIFO => InterruptHandler;
-});
-
 impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
-    async fn write_text(&'static self, text: &str) {
+    pub async fn write_text(&'static self, text: &str) {
         let bytes = line_to_u8_array(text);
         self.write_bytes(bytes).await;
     }
-    async fn write_bytes(&'static self, bytes_in: [u8; DIGIT_COUNT]) {
+    pub async fn write_bytes(&'static self, bytes_in: [u8; DIGIT_COUNT]) {
         let mut bytes_out = self.mutex_digits.lock().await;
         for (byte_out, byte_in) in bytes_out.iter_mut().zip(bytes_in.iter()) {
             *byte_out = *byte_in;
         }
+    }
+
+    pub async fn write_number(&'static self, mut number: u16) {
+        let mut bytes = [0; DIGIT_COUNT];
+
+        for i in (0..DIGIT_COUNT).rev() {
+            let digit = (number % 10) as usize; // Get the last digit
+            bytes[i] = Leds::DIGITS[digit];
+            number /= 10; // Remove the last digit
+            if number == 0 {
+                break;
+            }
+        }
+
+        // If the original number was out of range, turn on all decimal points
+        if number > 0 {
+            for byte in bytes.iter_mut() {
+                *byte |= Leds::DECIMAL;
+            }
+        }
+        self.write_bytes(bytes).await;
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -58,6 +100,9 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
         digit_pins: &'static mut [gpio::Output<'_>; DIGIT_COUNT],
         segment_pins: &'static mut [gpio::Output<'_>; 8],
     ) {
+        // cmk could instead skip blank digits, do identical letters together, and
+        // cmk hold single letters (and all blank) forever or until the mutex changes.
+        // cmk could also adjust the sleep based on the number of segments lit.
         loop {
             for digit_index in 0..DIGIT_COUNT {
                 // For this digit, get the segments to display as a bool iterator.
@@ -73,7 +118,9 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
 
                 // Activate, pause, and deactivate the digit
                 digit_pins[digit_index].set_low(); // Assuming common cathode setup
-                Timer::after(Duration::from_millis(SLEEP)).await;
+                                                   // cmk could do this at the same time as another wait.
+                let sleep = scale_adc_value(VIRTUAL_POTENTIOMETER1.read().await);
+                Timer::after(Duration::from_millis(sleep)).await;
                 digit_pins[digit_index].set_high();
             }
         }
@@ -110,6 +157,18 @@ async fn multiplex_display1(
     segment_pins: &'static mut [gpio::Output<'_>; 8],
 ) {
     VIRTUAL_DISPLAY1.multiplex(digit_pins, segment_pins).await;
+}
+
+static VIRTUAL_POTENTIOMETER1: VirtualPotentiometer = VirtualPotentiometer {
+    mutex_level: Mutex::new(12),
+};
+
+#[embassy_executor::task]
+async fn multiplex_potentiometer1(
+    adc: &'static mut Adc<'static, Async>,
+    adc_pin: &'static mut Channel<'static>,
+) {
+    VIRTUAL_POTENTIOMETER1.multiplex(adc, adc_pin).await;
 }
 
 struct Pins {
@@ -203,7 +262,8 @@ async fn main(_spawner0: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(Executor::new());
             executor1.run(|spawner1| {
-                unwrap!(spawner1.spawn(multiplex_display1(pins.digits1, pins.segments1)))
+                unwrap!(spawner1.spawn(multiplex_display1(pins.digits1, pins.segments1)));
+                unwrap!(spawner1.spawn(multiplex_potentiometer1(pins.adc, pins.adc_pin)));
             });
         },
     );
@@ -211,14 +271,25 @@ async fn main(_spawner0: Spawner) {
 
     // Display "RUST" on the 4-digit 7-segment display while we render the movies
     VIRTUAL_DISPLAY1.write_text("RUST").await;
+    // VIRTUAL_DISPLAY1.write_number(1).await;
+    // Timer::after(Duration::from_millis(100)).await;
+    // VIRTUAL_DISPLAY1.write_number(12).await;
+    // Timer::after(Duration::from_millis(100)).await;
+    // VIRTUAL_DISPLAY1.write_number(123).await;
+    // Timer::after(Duration::from_millis(100)).await;
+    // VIRTUAL_DISPLAY1.write_number(1234).await;
+    // Timer::after(Duration::from_millis(100)).await;
+    // VIRTUAL_DISPLAY1.write_number(12345).await;
+    // Timer::after(Duration::from_millis(1000)).await;
 
-    loop {
-        let level = pins.adc.read(pins.adc_pin).await.unwrap();
-        let scale = scale_adc_value(level);
-        let s = format!("{:04}", scale);
-        VIRTUAL_DISPLAY1.write_text(&s).await;
-        Timer::after(Duration::from_millis(SLEEP)).await;
-    }
+    // loop {
+    //     let level = pins.adc.read(pins.adc_pin).await.unwrap();
+    //     let scale = scale_adc_value(level);
+    //     // cmk we should have a way to write numbers without converting to string
+    //     let s = format!("{:04}", scale);
+    //     VIRTUAL_DISPLAY1.write_text(&s).await;
+    //     Timer::after(Duration::from_millis(SLEEP)).await;
+    // }
 
     // Render the movies -- this is CPU intensive and will run on core0
     let render_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
@@ -248,7 +319,7 @@ async fn main(_spawner0: Spawner) {
 
             // The button was pressed, so wait for it to be released
             pins.led0.set_high(); // mirror button press on led0
-            Timer::after(Duration::from_millis(SLEEP)).await; // debounce button
+            Timer::after(Duration::from_millis(5)).await; // debounce button
             pins.button.wait_for_falling_edge().await;
             pins.led0.set_low();
         }

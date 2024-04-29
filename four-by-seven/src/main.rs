@@ -9,18 +9,20 @@ const HEAP_SIZE: usize = 1024 * 64; // in bytes
 
 use core::array;
 use core::cmp::max;
+use heapless::{LinearMap, Vec};
 
 use alloc_cortex_m::CortexMHeap;
 use defmt::unwrap;
 use embassy_executor::{Executor, Spawner};
 use embassy_futures::select::{select, Either};
-use embassy_rp::adc::{Adc, Async, Channel, Config, InterruptHandler};
+use embassy_rp::adc::{Adc, Async, Channel as AdcChannel, Config, InterruptHandler};
 use embassy_rp::{
     bind_interrupts, gpio,
     multicore::{spawn_core1, Stack},
     peripherals::CORE1,
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_hal_1::digital::OutputPin;
@@ -44,7 +46,7 @@ impl VirtualPotentiometer {
     async fn multiplex(
         &'static self,
         acd: &'static mut Adc<'static, Async>,
-        adc_pin: &'static mut Channel<'static>,
+        adc_pin: &'static mut AdcChannel<'static>,
     ) {
         loop {
             let level_in = acd.read(adc_pin).await;
@@ -57,20 +59,31 @@ impl VirtualPotentiometer {
     }
 }
 
+static CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+
 pub struct VirtualDisplay<const DIGIT_COUNT: usize> {
     mutex_digits: Mutex<CriticalSectionRawMutex, [u8; DIGIT_COUNT]>,
 }
 
 impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
+    pub fn init() -> Self {
+        Self {
+            mutex_digits: Mutex::new([255; DIGIT_COUNT]),
+        }
+    }
     pub async fn write_text(&'static self, text: &str) {
         let bytes = line_to_u8_array(text);
         self.write_bytes(bytes).await;
     }
     pub async fn write_bytes(&'static self, bytes_in: [u8; DIGIT_COUNT]) {
-        let mut bytes_out = self.mutex_digits.lock().await;
-        for (byte_out, byte_in) in bytes_out.iter_mut().zip(bytes_in.iter()) {
-            *byte_out = *byte_in;
+        {
+            // inner scope to release the lock
+            let mut bytes_out = self.mutex_digits.lock().await;
+            for (byte_out, byte_in) in bytes_out.iter_mut().zip(bytes_in.iter()) {
+                *byte_out = *byte_in;
+            }
         }
+        let _ = CHANNEL.try_send(());
     }
 
     pub async fn write_number(&'static self, mut number: u16) {
@@ -104,44 +117,99 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
         // cmk hold single letters (and all blank) forever or until the mutex changes.
         // cmk could also adjust the sleep based on the number of segments lit.
         loop {
-            for digit_index in 0..DIGIT_COUNT {
-                // For this digit, get the segments to display as a bool iterator.
-                // This is async because we may need to wait for the display's availability.
-                let bool_iter = self.bool_iter(digit_index).await;
-
-                // Set the segment pins with the bool iterator
-                bool_iter
-                    .zip(segment_pins.iter_mut())
-                    .for_each(|(state, segment_pin)| {
-                        segment_pin.set_state(state.into()).unwrap();
-                    });
-
-                // Activate, pause, and deactivate the digit
-                digit_pins[digit_index].set_low(); // Assuming common cathode setup
-                                                   // cmk could do this at the same time as another wait.
-                let sleep = scale_adc_value(VIRTUAL_POTENTIOMETER1.read().await);
-                Timer::after(Duration::from_millis(sleep)).await;
-                digit_pins[digit_index].set_high();
+            // How many unique, non-blank digits?
+            let mut map: LinearMap<u8, Vec<usize, DIGIT_COUNT>, DIGIT_COUNT> = LinearMap::new();
+            {
+                // inner scope to release the lock
+                let digits = self.mutex_digits.lock().await;
+                let digits = digits.iter();
+                for (index, byte) in digits.enumerate() {
+                    if *byte != 0 {
+                        if let Some(vec) = map.get_mut(byte) {
+                            vec.push(index).unwrap();
+                        } else {
+                            let mut vec = Vec::default();
+                            vec.push(index).unwrap();
+                            map.insert(*byte, vec).unwrap();
+                        }
+                    }
+                }
+            }
+            // If none, just wait 3 seconds
+            // if 1, display it and wait 1 second
+            // otherwise, multiplex them
+            match map.len() {
+                0 => CHANNEL.receive().await,
+                1 => {
+                    // get one and only key and value
+                    let (byte, indexes) = map.iter().next().unwrap();
+                    // Set the segment pins with the bool iterator
+                    bool_iter(*byte).zip(segment_pins.iter_mut()).for_each(
+                        |(state, segment_pin)| {
+                            segment_pin.set_state(state.into()).unwrap();
+                        },
+                    );
+                    // activate the digits
+                    for digit_index in indexes.iter() {
+                        digit_pins[*digit_index].set_low(); // Assuming common cathode setup
+                    }
+                    CHANNEL.receive().await;
+                    for digit_index in indexes.iter() {
+                        digit_pins[*digit_index].set_high();
+                    }
+                }
+                _ => {
+                    loop {
+                        for (byte, indexes) in map.iter() {
+                            // Set the segment pins with the bool iterator
+                            bool_iter(*byte).zip(segment_pins.iter_mut()).for_each(
+                                |(state, segment_pin)| {
+                                    segment_pin.set_state(state.into()).unwrap();
+                                },
+                            );
+                            // Activate, pause, and deactivate the digits
+                            for digit_index in indexes.iter() {
+                                digit_pins[*digit_index].set_low(); // Assuming common cathode setup
+                            }
+                            // cmk could do this at the same time as another wait.
+                            // cmk when map.len is small, may want to wait longer
+                            let mut sleep = scale_adc_value(VIRTUAL_POTENTIOMETER1.read().await);
+                            sleep = sleep * DIGIT_COUNT as u64 / map.len() as u64;
+                            Timer::after(Duration::from_millis(sleep)).await;
+                            for digit_index in indexes.iter() {
+                                digit_pins[*digit_index].set_high();
+                            }
+                        }
+                        // break out of loop if the mutex has changed
+                        if CHANNEL.try_receive().is_err() {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
 
-    async fn bool_iter(&'static self, digit_index: usize) -> array::IntoIter<bool, 8> {
+    pub async fn bool_iter(&'static self, digit_index: usize) -> array::IntoIter<bool, 8> {
         // inner scope to release the lock
-        let mut byte: u8;
+        let byte: u8;
         {
             let digit_array = self.mutex_digits.lock().await;
             byte = digit_array[digit_index];
         }
-
-        // turn a u8 into an iterator of bool
-        let mut bools_out = [false; 8];
-        for bool_out in bools_out.iter_mut() {
-            *bool_out = byte & 1 == 1;
-            byte >>= 1;
-        }
-        bools_out.into_iter()
+        bool_iter(byte)
     }
+}
+
+#[inline]
+pub fn bool_iter(mut byte: u8) -> array::IntoIter<bool, 8> {
+    // turn a u8 into an iterator of bool
+    let mut bools_out = [false; 8];
+    for bool_out in bools_out.iter_mut() {
+        *bool_out = byte & 1 == 1;
+        byte >>= 1;
+    }
+    bools_out.into_iter()
 }
 
 // Display #1 is a 4-digit 7-segment display
@@ -166,7 +234,7 @@ static VIRTUAL_POTENTIOMETER1: VirtualPotentiometer = VirtualPotentiometer {
 #[embassy_executor::task]
 async fn multiplex_potentiometer1(
     adc: &'static mut Adc<'static, Async>,
-    adc_pin: &'static mut Channel<'static>,
+    adc_pin: &'static mut AdcChannel<'static>,
 ) {
     VIRTUAL_POTENTIOMETER1.multiplex(adc, adc_pin).await;
 }
@@ -177,7 +245,7 @@ struct Pins {
     button: &'static mut gpio::Input<'static>,
     led0: &'static mut gpio::Output<'static>,
     adc: &'static mut Adc<'static, Async>,
-    adc_pin: &'static mut Channel<'static>,
+    adc_pin: &'static mut AdcChannel<'static>,
 }
 
 impl Pins {
@@ -213,8 +281,8 @@ impl Pins {
 
         static ADC: StaticCell<Adc<Async>> = StaticCell::new();
         let adc = ADC.init(Adc::new(p.ADC, Irqs, Config::default()));
-        static ADC_PIN: StaticCell<Channel> = StaticCell::new();
-        let adc_pin = ADC_PIN.init(Channel::new_pin(p.PIN_26, gpio::Pull::None));
+        static ADC_PIN: StaticCell<AdcChannel> = StaticCell::new();
+        let adc_pin = ADC_PIN.init(AdcChannel::new_pin(p.PIN_26, gpio::Pull::None));
 
         (
             Self {

@@ -7,6 +7,7 @@ extern crate alloc;
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 const HEAP_SIZE: usize = 1024 * 64; // in bytes
 
+use alloc::format;
 use core::array;
 use core::cmp::max;
 use heapless::{LinearMap, Vec};
@@ -36,32 +37,66 @@ bind_interrupts!(struct Irqs {
 });
 
 static VIRTUAL_POTENTIOMETER1: VirtualPotentiometer = VirtualPotentiometer {
-    mutex_adc_pair: Mutex::new(None),
+    mutex_adc_unit: Mutex::new(None),
 };
 
-#[allow(clippy::type_complexity)] // cmk
+static VIRTUAL_POTENTIOMETER2: VirtualPotentiometer = VirtualPotentiometer {
+    mutex_adc_unit: Mutex::new(None),
+};
 
-pub struct VirtualPotentiometer {
-    mutex_adc_pair: Mutex<
-        CriticalSectionRawMutex,
-        Option<(
-            u16,
-            &'static mut Adc<'static, Async>,
-            &'static mut AdcChannel<'static>,
-        )>,
-    >,
+static MUTEX_ADC: Mutex<CriticalSectionRawMutex, Option<&'static mut Adc<'static, Async>>> =
+    Mutex::new(None);
+
+struct AdcUnit {
+    last_reading: u16,
+    adc_channel: &'static mut AdcChannel<'static>,
 }
 
-impl VirtualPotentiometer {
-    async fn read(&'static self) -> u16 {
-        let mut adc_pair = self.mutex_adc_pair.lock().await;
-        // Use `as_mut()` to convert `Option<&mut T>` to `&mut Option<T>` and then unwrap.
-        let (level_out, adc, adc_pin) = adc_pair.as_mut().unwrap();
-        // Now `adc` and `adc_pin` are mutable references.
-        if let Ok(level_in) = adc.read(adc_pin).await {
-            *level_out = level_in;
+impl AdcUnit {
+    fn new(last_reading: u16, adc_channel: &'static mut AdcChannel<'static>) -> Self {
+        Self {
+            last_reading,
+            adc_channel,
         }
-        *level_out
+    }
+
+    pub(crate) async fn read(&mut self) -> u16 {
+        let mut mutex_adc = MUTEX_ADC.lock().await;
+        let adc = mutex_adc.as_mut().unwrap();
+        if let Ok(reading) = adc.read(self.adc_channel).await {
+            self.last_reading = reading;
+        }
+        self.last_reading
+    }
+}
+
+pub struct VirtualPotentiometer {
+    mutex_adc_unit: Mutex<CriticalSectionRawMutex, Option<AdcUnit>>,
+}
+
+// cmk rename VirtualAdc
+impl VirtualPotentiometer {
+    pub async fn init(&self, last_reading: u16, adc_channel: &'static mut AdcChannel<'static>) {
+        let adc_unit = AdcUnit::new(last_reading, adc_channel);
+        let mut mutex_adc_unit = self.mutex_adc_unit.lock().await;
+        *mutex_adc_unit = Some(adc_unit);
+    }
+
+    pub async fn read(&'static self) -> u16 {
+        let mut adc_unit = self.mutex_adc_unit.lock().await;
+        let adc_unit = adc_unit.as_mut().unwrap();
+        adc_unit.read().await
+    }
+
+    async fn multiplex(&'static self, sleep: Duration) {
+        loop {
+            {
+                let mut adc_unit = self.mutex_adc_unit.lock().await;
+                let adc_unit = adc_unit.as_mut().unwrap();
+                let _ = adc_unit.read().await;
+            }
+            Timer::after(sleep).await;
+        }
     }
 }
 
@@ -88,8 +123,8 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
         let _ = self.update_display_channel.try_send(());
     }
 
-    pub async fn write_number(&'static self, mut number: u16) {
-        let mut bytes = [0; DIGIT_COUNT];
+    pub async fn write_number(&'static self, mut number: u16, padding: u8) {
+        let mut bytes = [padding; DIGIT_COUNT];
 
         for i in (0..DIGIT_COUNT).rev() {
             let digit = (number % 10) as usize; // Get the last digit
@@ -172,8 +207,9 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
                                 digit_pins[*digit_index].set_low(); // Assuming common cathode setup
                             }
                             // cmk improve overflow, scaling, avoiding 1, etc.
-                            let mut sleep = scale_adc_value(VIRTUAL_POTENTIOMETER1.read().await);
-                            sleep = sleep * DIGIT_COUNT as u64 / map.len() as u64;
+                            // let mut sleep = scale_adc_value(VIRTUAL_POTENTIOMETER1.read().await);
+                            // sleep = sleep * DIGIT_COUNT as u64 / map.len() as u64;
+                            let sleep = 3;
                             // Sleep (but wake up early if the display should be updated)
                             select(
                                 Timer::after(Duration::from_millis(sleep)),
@@ -234,17 +270,25 @@ async fn multiplex_display1(
     VIRTUAL_DISPLAY1.multiplex(digit_pins, segment_pins).await;
 }
 
+#[embassy_executor::task]
+async fn multiplex_potentiometer2() {
+    VIRTUAL_POTENTIOMETER2
+        .multiplex(Duration::from_millis(5000))
+        .await;
+}
+
 struct Pins {
     digits1: &'static mut [gpio::Output<'static>; DIGIT_COUNT1],
     segments1: &'static mut [gpio::Output<'static>; 8],
     button: &'static mut gpio::Input<'static>,
     led0: &'static mut gpio::Output<'static>,
     adc: &'static mut Adc<'static, Async>,
-    adc_pin: &'static mut AdcChannel<'static>,
+    adc_pin0: &'static mut AdcChannel<'static>,
+    adc_temp_sensor: &'static mut AdcChannel<'static>,
 }
 
 impl Pins {
-    fn new() -> (Self, CORE1) {
+    fn new_and_core1() -> (Self, CORE1) {
         let p: embassy_rp::Peripherals = embassy_rp::init(Default::default());
         let core1 = p.CORE1;
 
@@ -277,7 +321,9 @@ impl Pins {
         static ADC: StaticCell<Adc<Async>> = StaticCell::new();
         let adc = ADC.init(Adc::new(p.ADC, Irqs, Config::default()));
         static ADC_PIN: StaticCell<AdcChannel> = StaticCell::new();
-        let adc_pin = ADC_PIN.init(AdcChannel::new_pin(p.PIN_26, gpio::Pull::None));
+        let adc_pin0 = ADC_PIN.init(AdcChannel::new_pin(p.PIN_26, gpio::Pull::None));
+        static ADC_TEMP_SENSOR: StaticCell<AdcChannel> = StaticCell::new();
+        let adc_temp_sensor = ADC_TEMP_SENSOR.init(AdcChannel::new_temp_sensor(p.ADC_TEMP_SENSOR));
 
         (
             Self {
@@ -286,7 +332,8 @@ impl Pins {
                 button,
                 led0,
                 adc,
-                adc_pin,
+                adc_pin0,
+                adc_temp_sensor,
             },
             core1,
         )
@@ -296,7 +343,21 @@ impl Pins {
 static mut CORE1_STACK: Stack<4096> = Stack::new();
 static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 
-fn scale_adc_value(adc_value: u16) -> u64 {
+// cmk move this
+pub fn convert_to_celsius(raw_temp: u16) -> f32 {
+    // According to chapter 4.9.5. Temperature Sensor in RP2040 datasheet
+    let temp = 27.0 - (raw_temp as f32 * 3.3 / 4096.0 - 0.706) / 0.001721;
+    let sign = if temp < 0.0 { -1.0 } else { 1.0 };
+    let rounded_temp_x10: i16 = ((temp * 10.0) + 0.5 * sign) as i16;
+    (rounded_temp_x10 as f32) / 10.0
+}
+
+fn celsius_to_fahrenheit(celsius: f32) -> f32 {
+    celsius * 9.0 / 5.0 + 32.0
+}
+
+// cmk move this
+pub fn scale_adc_value(adc_value: u16) -> u64 {
     let old_min: u16 = 15;
     let old_max: u16 = 4076;
     let new_min: u64 = 0;
@@ -316,13 +377,11 @@ fn scale_adc_value(adc_value: u16) -> u64 {
 async fn main(_spawner0: Spawner) {
     unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
 
-    let (pins, core1) = Pins::new();
+    let (pins, core1) = Pins::new_and_core1();
 
-    VIRTUAL_POTENTIOMETER1
-        .mutex_adc_pair
-        .lock()
-        .await
-        .replace((12, pins.adc, pins.adc_pin));
+    MUTEX_ADC.lock().await.replace(pins.adc);
+    VIRTUAL_POTENTIOMETER1.init(0, pins.adc_pin0).await;
+    VIRTUAL_POTENTIOMETER2.init(0, pins.adc_temp_sensor).await;
 
     // Spawn 'multiplex_display1' on core1
     spawn_core1(
@@ -332,13 +391,24 @@ async fn main(_spawner0: Spawner) {
             let executor1 = EXECUTOR1.init(Executor::new());
             executor1.run(|spawner1| {
                 unwrap!(spawner1.spawn(multiplex_display1(pins.digits1, pins.segments1)));
-                // unwrap!(spawner1.spawn(multiplex_potentiometer1(pins.adc, pins.adc_pin)));
+                unwrap!(spawner1.spawn(multiplex_potentiometer2()));
             });
         },
     );
 
     // Display "RUST" on the 4-digit 7-segment display while we render the movies
-    VIRTUAL_DISPLAY1.write_text("RUST").await;
+    // VIRTUAL_DISPLAY1.write_text("RUST").await;
+    loop {
+        let temp = convert_to_celsius(VIRTUAL_POTENTIOMETER2.read().await);
+        let text = format!("{temp:.0}C");
+        VIRTUAL_DISPLAY1.write_text(&text).await;
+        Timer::after(Duration::from_millis(1000)).await;
+        let temp = convert_to_celsius(VIRTUAL_POTENTIOMETER2.read().await);
+        let temp = celsius_to_fahrenheit(temp);
+        let text = format!("{temp:.0}F");
+        VIRTUAL_DISPLAY1.write_text(&text).await;
+        Timer::after(Duration::from_millis(1000)).await;
+    }
 
     // Render the movies -- this is CPU intensive and will run on core0
     let render_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =

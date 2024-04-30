@@ -34,28 +34,34 @@ use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to y
 bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => InterruptHandler;
 });
+
+static VIRTUAL_POTENTIOMETER1: VirtualPotentiometer = VirtualPotentiometer {
+    mutex_adc_pair: Mutex::new(None),
+};
+
+#[allow(clippy::type_complexity)] // cmk
+
 pub struct VirtualPotentiometer {
-    mutex_level: Mutex<CriticalSectionRawMutex, u16>,
+    mutex_adc_pair: Mutex<
+        CriticalSectionRawMutex,
+        Option<(
+            u16,
+            &'static mut Adc<'static, Async>,
+            &'static mut AdcChannel<'static>,
+        )>,
+    >,
 }
 
 impl VirtualPotentiometer {
     async fn read(&'static self) -> u16 {
-        let level = self.mutex_level.lock().await;
-        *level
-    }
-    async fn multiplex(
-        &'static self,
-        acd: &'static mut Adc<'static, Async>,
-        adc_pin: &'static mut AdcChannel<'static>,
-    ) {
-        loop {
-            let level_in = acd.read(adc_pin).await;
-            if let Ok(level_in) = level_in {
-                let mut level_out = self.mutex_level.lock().await;
-                *level_out = level_in;
-            }
-            Timer::after(Duration::from_millis(100)).await;
+        let mut adc_pair = self.mutex_adc_pair.lock().await;
+        // Use `as_mut()` to convert `Option<&mut T>` to `&mut Option<T>` and then unwrap.
+        let (level_out, adc, adc_pin) = adc_pair.as_mut().unwrap();
+        // Now `adc` and `adc_pin` are mutable references.
+        if let Ok(level_in) = adc.read(adc_pin).await {
+            *level_out = level_in;
         }
+        *level_out
     }
 }
 
@@ -228,18 +234,6 @@ async fn multiplex_display1(
     VIRTUAL_DISPLAY1.multiplex(digit_pins, segment_pins).await;
 }
 
-static VIRTUAL_POTENTIOMETER1: VirtualPotentiometer = VirtualPotentiometer {
-    mutex_level: Mutex::new(12),
-};
-
-#[embassy_executor::task]
-async fn multiplex_potentiometer1(
-    adc: &'static mut Adc<'static, Async>,
-    adc_pin: &'static mut AdcChannel<'static>,
-) {
-    VIRTUAL_POTENTIOMETER1.multiplex(adc, adc_pin).await;
-}
-
 struct Pins {
     digits1: &'static mut [gpio::Output<'static>; DIGIT_COUNT1],
     segments1: &'static mut [gpio::Output<'static>; 8],
@@ -305,7 +299,7 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 fn scale_adc_value(adc_value: u16) -> u64 {
     let old_min: u16 = 15;
     let old_max: u16 = 4076;
-    let new_min: u64 = 1;
+    let new_min: u64 = 0;
     let new_max: u64 = 100;
 
     // Use saturating_sub to prevent underflow
@@ -324,6 +318,12 @@ async fn main(_spawner0: Spawner) {
 
     let (pins, core1) = Pins::new();
 
+    VIRTUAL_POTENTIOMETER1
+        .mutex_adc_pair
+        .lock()
+        .await
+        .replace((12, pins.adc, pins.adc_pin));
+
     // Spawn 'multiplex_display1' on core1
     spawn_core1(
         core1,
@@ -332,7 +332,7 @@ async fn main(_spawner0: Spawner) {
             let executor1 = EXECUTOR1.init(Executor::new());
             executor1.run(|spawner1| {
                 unwrap!(spawner1.spawn(multiplex_display1(pins.digits1, pins.segments1)));
-                unwrap!(spawner1.spawn(multiplex_potentiometer1(pins.adc, pins.adc_pin)));
+                // unwrap!(spawner1.spawn(multiplex_potentiometer1(pins.adc, pins.adc_pin)));
             });
         },
     );

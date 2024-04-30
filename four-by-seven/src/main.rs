@@ -9,7 +9,6 @@ const HEAP_SIZE: usize = 1024 * 64; // in bytes
 
 use core::array;
 use core::cmp::max;
-use embassy_futures::join::join;
 use heapless::{LinearMap, Vec};
 
 use alloc_cortex_m::CortexMHeap;
@@ -60,20 +59,12 @@ impl VirtualPotentiometer {
     }
 }
 
-// static CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-
 pub struct VirtualDisplay<const DIGIT_COUNT: usize> {
     mutex_digits: Mutex<CriticalSectionRawMutex, [u8; DIGIT_COUNT]>,
     update_display_channel: Channel<CriticalSectionRawMutex, (), 1>,
 }
 
 impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
-    // pub fn init() -> Self {
-    //     Self {
-    //         mutex_digits: Mutex::new([255; DIGIT_COUNT]),
-    //         channel: Channel::new(),
-    //     }
-    // }
     pub async fn write_text(&'static self, text: &str) {
         let bytes = line_to_u8_array(text);
         self.write_bytes(bytes).await;
@@ -118,9 +109,6 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
         digit_pins: &'static mut [gpio::Output<'_>; DIGIT_COUNT],
         segment_pins: &'static mut [gpio::Output<'_>; 8],
     ) {
-        // cmk could instead skip blank digits, do identical letters together, and
-        // cmk hold single letters (and all blank) forever or until the mutex changes.
-        // cmk could also adjust the sleep based on the number of segments lit.
         loop {
             // How many unique, non-blank digits?
             let mut map: LinearMap<u8, Vec<usize, DIGIT_COUNT>, DIGIT_COUNT> = LinearMap::new();
@@ -140,9 +128,6 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
                     }
                 }
             }
-            // If none, just wait 3 seconds
-            // if 1, display it and wait 1 second
-            // otherwise, multiplex them
             match map.len() {
                 // If the display should be empty, then just wait for the next update
                 0 => self.update_display_channel.receive().await,
@@ -157,7 +142,7 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
                             segment_pin.set_state(state.into()).unwrap();
                         },
                     );
-                    // activate the digits
+                    // activate the digits, wait for the next update, and deactivate the digits
                     for digit_index in indexes.iter() {
                         digit_pins[*digit_index].set_low(); // Assuming common cathode setup
                     }
@@ -180,11 +165,10 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
                             for digit_index in indexes.iter() {
                                 digit_pins[*digit_index].set_low(); // Assuming common cathode setup
                             }
-                            // cmk could do this at the same time as another wait.
-                            // cmk when map.len is small, may want to wait longer
+                            // cmk improve overflow, scaling, avoiding 1, etc.
                             let mut sleep = scale_adc_value(VIRTUAL_POTENTIOMETER1.read().await);
                             sleep = sleep * DIGIT_COUNT as u64 / map.len() as u64;
-                            // Sleep (but wake up if the display should be updated)
+                            // Sleep (but wake up early if the display should be updated)
                             select(
                                 Timer::after(Duration::from_millis(sleep)),
                                 self.update_display_channel.receive(),
@@ -194,7 +178,7 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
                                 digit_pins[*digit_index].set_high();
                             }
                         }
-                        // break out of loop if the mutex has changed
+                        // break out of multiplexing loop if the display should be updated
                         if self.update_display_channel.try_receive().is_err() {
                             break;
                         }
@@ -204,6 +188,7 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
         }
     }
 
+    /// Turn a u8 into an iterator of bool
     pub async fn bool_iter(&'static self, digit_index: usize) -> array::IntoIter<bool, 8> {
         // inner scope to release the lock
         let byte: u8;
@@ -216,6 +201,7 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
 }
 
 #[inline]
+/// Turn a u8 into an iterator of bool
 pub fn bool_iter(mut byte: u8) -> array::IntoIter<bool, 8> {
     // turn a u8 into an iterator of bool
     let mut bools_out = [false; 8];
@@ -350,29 +336,9 @@ async fn main(_spawner0: Spawner) {
             });
         },
     );
-    // unwrap!(_spawner0.spawn(multiplex_display1(pins.digits1, pins.segments1)));
 
     // Display "RUST" on the 4-digit 7-segment display while we render the movies
     VIRTUAL_DISPLAY1.write_text("RUST").await;
-    // VIRTUAL_DISPLAY1.write_number(1).await;
-    // Timer::after(Duration::from_millis(100)).await;
-    // VIRTUAL_DISPLAY1.write_number(12).await;
-    // Timer::after(Duration::from_millis(100)).await;
-    // VIRTUAL_DISPLAY1.write_number(123).await;
-    // Timer::after(Duration::from_millis(100)).await;
-    // VIRTUAL_DISPLAY1.write_number(1234).await;
-    // Timer::after(Duration::from_millis(100)).await;
-    // VIRTUAL_DISPLAY1.write_number(12345).await;
-    // Timer::after(Duration::from_millis(1000)).await;
-
-    // loop {
-    //     let level = pins.adc.read(pins.adc_pin).await.unwrap();
-    //     let scale = scale_adc_value(level);
-    //     // cmk we should have a way to write numbers without converting to string
-    //     let s = format!("{:04}", scale);
-    //     VIRTUAL_DISPLAY1.write_text(&s).await;
-    //     Timer::after(Duration::from_millis(SLEEP)).await;
-    // }
 
     // Render the movies -- this is CPU intensive and will run on core0
     let render_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
@@ -413,9 +379,13 @@ const FPS: i32 = 24;
 
 fn line_to_u8_array<const DIGIT_COUNT: usize>(line: &str) -> [u8; DIGIT_COUNT] {
     let mut result = [0; DIGIT_COUNT];
-    for (i, c) in line.chars().enumerate() {
-        // cmk could try to go out of the array
+    (0..DIGIT_COUNT).zip(line.chars()).for_each(|(i, c)| {
         result[i] = Leds::ASCII_TABLE[c as usize];
+    });
+    if line.len() > DIGIT_COUNT {
+        for byte in result.iter_mut() {
+            *byte |= Leds::DECIMAL;
+        }
     }
     result
 }

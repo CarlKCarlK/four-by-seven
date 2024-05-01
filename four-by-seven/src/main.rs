@@ -44,26 +44,28 @@ static VIRTUAL_TEMP1: VirtualAnalogInput = VirtualAnalogInput {
     mutex_adc_unit: Mutex::new(None),
 };
 
-static MUTEX_ADC: Mutex<CriticalSectionRawMutex, Option<&'static mut Adc<'static, Async>>> =
-    Mutex::new(None);
-
 struct AdcUnit {
     last_reading: u16,
+    analog_mutex: &'static Mutex<CriticalSectionRawMutex, Adc<'static, Async>>,
     adc_channel: &'static mut AdcChannel<'static>,
 }
 
 impl AdcUnit {
-    fn new(last_reading: u16, adc_channel: &'static mut AdcChannel<'static>) -> Self {
+    fn new(
+        last_reading: u16,
+        analog_mutex: &'static Mutex<CriticalSectionRawMutex, Adc<'static, Async>>,
+        adc_channel: &'static mut AdcChannel<'static>,
+    ) -> Self {
         Self {
             last_reading,
+            analog_mutex,
             adc_channel,
         }
     }
 
     pub(crate) async fn read_slow(&mut self) -> u16 {
-        let mut mutex_adc = MUTEX_ADC.lock().await;
-        let adc = mutex_adc.as_mut().unwrap();
-        if let Ok(reading) = adc.read(self.adc_channel).await {
+        let mut analog_mutex = self.analog_mutex.lock().await;
+        if let Ok(reading) = analog_mutex.read(self.adc_channel).await {
             self.last_reading = reading;
         }
         self.last_reading
@@ -80,8 +82,13 @@ pub struct VirtualAnalogInput {
 
 // cmk rename VirtualAdc
 impl VirtualAnalogInput {
-    pub async fn init(&self, last_reading: u16, adc_channel: &'static mut AdcChannel<'static>) {
-        let adc_unit = AdcUnit::new(last_reading, adc_channel);
+    pub async fn init(
+        &self,
+        last_reading: u16,
+        analog_mutex: &'static Mutex<CriticalSectionRawMutex, Adc<'static, Async>>,
+        adc_channel: &'static mut AdcChannel<'static>,
+    ) {
+        let adc_unit = AdcUnit::new(last_reading, analog_mutex, adc_channel);
         let mut mutex_adc_unit = self.mutex_adc_unit.lock().await;
         *mutex_adc_unit = Some(adc_unit);
     }
@@ -292,9 +299,9 @@ struct Pins {
     segments1: &'static mut [gpio::Output<'static>; 8],
     button: &'static mut gpio::Input<'static>,
     led0: &'static mut gpio::Output<'static>,
-    adc: &'static mut Adc<'static, Async>,
-    adc_pin0: &'static mut AdcChannel<'static>,
-    adc_temp_sensor: &'static mut AdcChannel<'static>,
+    analog_mutex: &'static Mutex<CriticalSectionRawMutex, Adc<'static, Async>>,
+    analog_input0: &'static mut AdcChannel<'static>,
+    temp_sensor: &'static mut AdcChannel<'static>,
 }
 
 impl Pins {
@@ -328,12 +335,14 @@ impl Pins {
         static LED0_PIN: StaticCell<gpio::Output> = StaticCell::new();
         let led0 = LED0_PIN.init(gpio::Output::new(p.PIN_0, Level::Low));
 
-        static ADC: StaticCell<Adc<Async>> = StaticCell::new();
-        let adc = ADC.init(Adc::new(p.ADC, Irqs, Config::default()));
-        static ADC_PIN: StaticCell<AdcChannel> = StaticCell::new();
-        let adc_pin0 = ADC_PIN.init(AdcChannel::new_pin(p.PIN_26, gpio::Pull::None));
-        static ADC_TEMP_SENSOR: StaticCell<AdcChannel> = StaticCell::new();
-        let adc_temp_sensor = ADC_TEMP_SENSOR.init(AdcChannel::new_temp_sensor(p.ADC_TEMP_SENSOR));
+        static ANALOG_MUTEX: StaticCell<Mutex<CriticalSectionRawMutex, Adc<Async>>> =
+            StaticCell::new();
+        let analog_mutex = ANALOG_MUTEX.init(Mutex::new(Adc::new(p.ADC, Irqs, Config::default())));
+
+        static ANALOG_INPUT0: StaticCell<AdcChannel> = StaticCell::new();
+        let analog_input0 = ANALOG_INPUT0.init(AdcChannel::new_pin(p.PIN_26, gpio::Pull::None));
+        static TEMP_SENSOR: StaticCell<AdcChannel> = StaticCell::new();
+        let temp_sensor = TEMP_SENSOR.init(AdcChannel::new_temp_sensor(p.ADC_TEMP_SENSOR));
 
         (
             Self {
@@ -341,9 +350,9 @@ impl Pins {
                 segments1,
                 button,
                 led0,
-                adc,
-                adc_pin0,
-                adc_temp_sensor,
+                analog_mutex,
+                analog_input0,
+                temp_sensor,
             },
             core1,
         )
@@ -390,11 +399,14 @@ async fn main(_spawner0: Spawner) {
     let (pins, core1) = Pins::new_and_core1();
 
     // cmk can we make this a method and/or return a ADC unit with a pointer to the ADC mutex.
-    MUTEX_ADC.lock().await.replace(pins.adc);
     // cmk do all these at once?
     // cmk init virtual display, too.
-    VIRTUAL_POTENTIOMETER1.init(0, pins.adc_pin0).await;
-    VIRTUAL_TEMP1.init(0, pins.adc_temp_sensor).await;
+    VIRTUAL_POTENTIOMETER1
+        .init(0, pins.analog_mutex, pins.analog_input0)
+        .await;
+    VIRTUAL_TEMP1
+        .init(0, pins.analog_mutex, pins.temp_sensor)
+        .await;
 
     // Spawn 'multiplex_display1' on core1
     spawn_core1(

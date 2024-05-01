@@ -36,11 +36,11 @@ bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => InterruptHandler;
 });
 
-static VIRTUAL_POTENTIOMETER1: VirtualPotentiometer = VirtualPotentiometer {
+static VIRTUAL_POTENTIOMETER1: VirtualAnalogInput = VirtualAnalogInput {
     mutex_adc_unit: Mutex::new(None),
 };
 
-static VIRTUAL_POTENTIOMETER2: VirtualPotentiometer = VirtualPotentiometer {
+static VIRTUAL_TEMP1: VirtualAnalogInput = VirtualAnalogInput {
     mutex_adc_unit: Mutex::new(None),
 };
 
@@ -60,7 +60,7 @@ impl AdcUnit {
         }
     }
 
-    pub(crate) async fn read(&mut self) -> u16 {
+    pub(crate) async fn read_slow(&mut self) -> u16 {
         let mut mutex_adc = MUTEX_ADC.lock().await;
         let adc = mutex_adc.as_mut().unwrap();
         if let Ok(reading) = adc.read(self.adc_channel).await {
@@ -68,32 +68,43 @@ impl AdcUnit {
         }
         self.last_reading
     }
+
+    pub(crate) fn read_fast(&mut self) -> u16 {
+        self.last_reading
+    }
 }
 
-pub struct VirtualPotentiometer {
+pub struct VirtualAnalogInput {
     mutex_adc_unit: Mutex<CriticalSectionRawMutex, Option<AdcUnit>>,
 }
 
 // cmk rename VirtualAdc
-impl VirtualPotentiometer {
+impl VirtualAnalogInput {
     pub async fn init(&self, last_reading: u16, adc_channel: &'static mut AdcChannel<'static>) {
         let adc_unit = AdcUnit::new(last_reading, adc_channel);
         let mut mutex_adc_unit = self.mutex_adc_unit.lock().await;
         *mutex_adc_unit = Some(adc_unit);
     }
 
-    pub async fn read(&'static self) -> u16 {
+    pub async fn read_slow(&'static self) -> u16 {
         let mut adc_unit = self.mutex_adc_unit.lock().await;
         let adc_unit = adc_unit.as_mut().unwrap();
-        adc_unit.read().await
+        adc_unit.read_slow().await
     }
 
-    async fn multiplex(&'static self, sleep: Duration) {
+    // cmk maybe fail if monitor is not running
+    pub async fn read_fast(&'static self) -> u16 {
+        let mut adc_unit = self.mutex_adc_unit.lock().await;
+        let adc_unit = adc_unit.as_mut().unwrap();
+        adc_unit.read_fast()
+    }
+
+    async fn monitor(&'static self, sleep: Duration) {
         loop {
             {
                 let mut adc_unit = self.mutex_adc_unit.lock().await;
                 let adc_unit = adc_unit.as_mut().unwrap();
-                let _ = adc_unit.read().await;
+                let _ = adc_unit.read_slow().await;
             }
             Timer::after(sleep).await;
         }
@@ -145,7 +156,7 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
     }
 
     #[allow(clippy::needless_range_loop)]
-    async fn multiplex(
+    async fn monitor(
         &'static self,
         digit_pins: &'static mut [gpio::Output<'_>; DIGIT_COUNT],
         segment_pins: &'static mut [gpio::Output<'_>; 8],
@@ -262,19 +273,18 @@ static VIRTUAL_DISPLAY1: VirtualDisplay<DIGIT_COUNT1> = VirtualDisplay {
     update_display_channel: Channel::new(),
 };
 
+// cmk move the pins into the struct
 #[embassy_executor::task]
-async fn multiplex_display1(
+async fn monitor_display1(
     digit_pins: &'static mut [gpio::Output<'_>; DIGIT_COUNT1],
     segment_pins: &'static mut [gpio::Output<'_>; 8],
 ) {
-    VIRTUAL_DISPLAY1.multiplex(digit_pins, segment_pins).await;
+    VIRTUAL_DISPLAY1.monitor(digit_pins, segment_pins).await;
 }
 
 #[embassy_executor::task]
-async fn multiplex_potentiometer2() {
-    VIRTUAL_POTENTIOMETER2
-        .multiplex(Duration::from_millis(5000))
-        .await;
+async fn monitor_temp1() {
+    VIRTUAL_TEMP1.monitor(Duration::from_millis(5000)).await;
 }
 
 struct Pins {
@@ -379,9 +389,12 @@ async fn main(_spawner0: Spawner) {
 
     let (pins, core1) = Pins::new_and_core1();
 
+    // cmk can we make this a method and/or return a ADC unit with a pointer to the ADC mutex.
     MUTEX_ADC.lock().await.replace(pins.adc);
+    // cmk do all these at once?
+    // cmk init virtual display, too.
     VIRTUAL_POTENTIOMETER1.init(0, pins.adc_pin0).await;
-    VIRTUAL_POTENTIOMETER2.init(0, pins.adc_temp_sensor).await;
+    VIRTUAL_TEMP1.init(0, pins.adc_temp_sensor).await;
 
     // Spawn 'multiplex_display1' on core1
     spawn_core1(
@@ -390,8 +403,8 @@ async fn main(_spawner0: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(Executor::new());
             executor1.run(|spawner1| {
-                unwrap!(spawner1.spawn(multiplex_display1(pins.digits1, pins.segments1)));
-                unwrap!(spawner1.spawn(multiplex_potentiometer2()));
+                unwrap!(spawner1.spawn(monitor_display1(pins.digits1, pins.segments1)));
+                unwrap!(spawner1.spawn(monitor_temp1()));
             });
         },
     );
@@ -399,12 +412,12 @@ async fn main(_spawner0: Spawner) {
     // Display "RUST" on the 4-digit 7-segment display while we render the movies
     // VIRTUAL_DISPLAY1.write_text("RUST").await;
     loop {
-        let temp = convert_to_celsius(VIRTUAL_POTENTIOMETER2.read().await);
+        let temp = convert_to_celsius(VIRTUAL_TEMP1.read_fast().await) * 10.0;
         let text = format!("{temp:.0}C");
         VIRTUAL_DISPLAY1.write_text(&text).await;
         Timer::after(Duration::from_millis(1000)).await;
-        let temp = convert_to_celsius(VIRTUAL_POTENTIOMETER2.read().await);
-        let temp = celsius_to_fahrenheit(temp);
+        let temp = convert_to_celsius(VIRTUAL_TEMP1.read_fast().await);
+        let temp = celsius_to_fahrenheit(temp) * 10.0;
         let text = format!("{temp:.0}F");
         VIRTUAL_DISPLAY1.write_text(&text).await;
         Timer::after(Duration::from_millis(1000)).await;

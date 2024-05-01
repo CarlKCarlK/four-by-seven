@@ -117,9 +117,9 @@ pub struct VirtualDisplay<const DIGIT_COUNT: usize> {
 impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
     pub async fn write_text(&'static self, text: &str) {
         let bytes = line_to_u8_array(text);
-        self.write_bytes(bytes).await;
+        self.write_bytes(&bytes).await;
     }
-    pub async fn write_bytes(&'static self, bytes_in: [u8; DIGIT_COUNT]) {
+    pub async fn write_bytes(&'static self, bytes_in: &[u8; DIGIT_COUNT]) {
         {
             // inner scope to release the lock
             let mut bytes_out = self.mutex_digits.lock().await;
@@ -150,7 +150,7 @@ impl<const DIGIT_COUNT: usize> VirtualDisplay<DIGIT_COUNT> {
                 *byte |= Leds::DECIMAL;
             }
         }
-        self.write_bytes(bytes).await;
+        self.write_bytes(&bytes).await;
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -433,19 +433,19 @@ async fn main(_spawner0: Spawner) {
     );
 
     // Display "RUST" on the 4-digit 7-segment display while we render the movies
-    // VIRTUAL_DISPLAY1.write_text("RUST").await;
-    loop {
-        let temp = convert_to_celsius(VIRTUAL_TEMP1.read_fast().await) * 10.0;
-        let text = format!("{temp:.0}C");
-        VIRTUAL_DISPLAY1.write_text(&text).await;
-        Timer::after(Duration::from_millis(1000)).await;
-        let temp = convert_to_celsius(VIRTUAL_TEMP1.read_fast().await);
-        let temp = celsius_to_fahrenheit(temp) * 10.0;
-        let text = format!("{temp:.0}F");
-        VIRTUAL_DISPLAY1.write_text(&text).await;
-        Timer::after(Duration::from_millis(1000)).await;
-    }
+    // loop {
+    //     let temp = convert_to_celsius(VIRTUAL_TEMP1.read_fast().await) * 10.0;
+    //     let text = format!("{temp:.0}C");
+    //     VIRTUAL_DISPLAY1.write_text(&text).await;
+    //     Timer::after(Duration::from_millis(1000)).await;
+    //     let temp = convert_to_celsius(VIRTUAL_TEMP1.read_fast().await);
+    //     let temp = celsius_to_fahrenheit(temp) * 10.0;
+    //     let text = format!("{temp:.0}F");
+    //     VIRTUAL_DISPLAY1.write_text(&text).await;
+    //     Timer::after(Duration::from_millis(1000)).await;
+    // }
 
+    VIRTUAL_DISPLAY1.write_text("RUST").await;
     // Render the movies -- this is CPU intensive and will run on core0
     let render_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
         [hello_world_wide(), circles_wide()];
@@ -453,10 +453,9 @@ async fn main(_spawner0: Spawner) {
     // loop through the movies, forever
     for movie in render_movies.iter().cycle() {
         // Loop through the frames of the current movie
-        for range_values in movie.range_values() {
+        for (range, frame) in movie.range_values() {
             // Get the next frame of the movie (and its duration)
-            let (start, end) = range_values.range.into_inner();
-            let frame = *range_values.value;
+            let (start, end) = range.into_inner();
 
             // Display the frame
             VIRTUAL_DISPLAY1.write_bytes(frame).await;
@@ -509,10 +508,10 @@ pub fn hello_world_wide() -> RangeMapBlaze<i32, [u8; DIGIT_COUNT1]> {
     let message = message
         .range_values()
         .enumerate()
-        .map(|(i, range_value)| {
-            let (start, end) = range_value.range.clone().into_inner();
+        .map(|(i, (range, frame))| {
+            let (start, end) = range.clone().into_inner();
             let new_range = start + i as i32 * 3..=end + i as i32 * 3;
-            (new_range, range_value.value)
+            (new_range, frame)
         })
         .collect();
     message
@@ -530,10 +529,10 @@ pub fn hello_world() -> RangeMapBlaze<i32, u8> {
     let message = message
         .range_values()
         .enumerate()
-        .map(|(i, range_value)| {
-            let (start, end) = range_value.range.clone().into_inner();
+        .map(|(i, (range, frame))| {
+            let (start, end) = range.clone().into_inner();
             let new_range = start + i as i32 * 3..=end + i as i32 * 3;
-            (new_range, range_value.value)
+            (new_range, frame)
         })
         .collect();
     message
@@ -791,8 +790,8 @@ pub fn linear(
 
     range_map_blaze
         .range_values()
-        .map(|range_value| {
-            let (start, end) = range_value.range.clone().into_inner();
+        .map(|(range, frame)| {
+            let (start, end) = range.clone().into_inner();
             let mut a = (start - first) * scale.abs() + first;
             let mut b = (end + 1 - first) * scale.abs() + first - 1;
             let last = (last + 1 - first) * scale.abs() + first - 1;
@@ -800,7 +799,7 @@ pub fn linear(
                 (a, b) = (last - b + first, last - a + first);
             }
             let new_range = a + shift..=b + shift;
-            (new_range, range_value.value)
+            (new_range, frame)
         })
         .collect()
 }
@@ -819,8 +818,8 @@ pub fn linear_wide<const DIGIT_COUNT: usize>(
 
     range_map_blaze
         .range_values()
-        .map(|range_value| {
-            let (start, end) = range_value.range.clone().into_inner();
+        .map(|(range, frame)| {
+            let (start, end) = range.clone().into_inner();
             let mut a = (start - first) * scale.abs() + first;
             let mut b = (end + 1 - first) * scale.abs() + first - 1;
             let last = (last + 1 - first) * scale.abs() + first - 1;
@@ -828,7 +827,7 @@ pub fn linear_wide<const DIGIT_COUNT: usize>(
                 (a, b) = (last - b + first, last - a + first);
             }
             let new_range = a + shift..=b + shift;
-            (new_range, range_value.value)
+            (new_range, frame)
         })
         .collect()
 }

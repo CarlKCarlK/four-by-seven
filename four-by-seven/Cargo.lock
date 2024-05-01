@@ -1441,14 +1441,15 @@ checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
 name = "range-set-blaze"
-version = "0.1.16-alpha1"
+version = "0.2.0-alpha1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cab29a22077da910529d56968f2b64187b10cdaaf0e21824f63937bdbfa3c747"
+checksum = "324c32fe13175c0c7bc2109ed7bb526190df78f2dd896fa7c72580733dbe05da"
 dependencies = [
  "gen_ops",
  "itertools 0.12.1",
  "num-integer",
  "num-traits",
+ "syntactic-for",
 ]
 
 [[package]]
@@ -1735,6 +1736,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "syntactic-for"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a897d1a2219333b336dc5cac1b87935c4e18b0702676185ed3699255ad942757"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]

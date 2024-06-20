@@ -432,7 +432,6 @@ async fn main(_spawner0: Spawner) {
         },
     );
 
-    // Display "RUST" on the 4-digit 7-segment display while we render the movies
     // loop {
     //     let temp = convert_to_celsius(VIRTUAL_TEMP1.read_fast().await) * 10.0;
     //     let text = format!("{temp:.0}C");
@@ -445,6 +444,7 @@ async fn main(_spawner0: Spawner) {
     //     Timer::after(Duration::from_millis(1000)).await;
     // }
 
+    // Display "RUST" on the 4-digit 7-segment display while we render the movies
     VIRTUAL_DISPLAY1.write_text("RUST").await;
     // Render the movies -- this is CPU intensive and will run on core0
     let render_movies: [RangeMapBlaze<i32, [u8; DIGIT_COUNT1]>; 2] =
